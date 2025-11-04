@@ -95,14 +95,27 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local_name = f"{timestamp}__{doc.file_name or 'program.docx'}"
     local_path = DATA_DIR / local_name
     await file.download_to_drive(local_path.as_posix())
+    logger.info(f"📥 Сохранён файл: {local_path}")
 
+    # ==== УДАЛИТЬ (тест docx_reader) ====
+    from utils.docx_reader import read_program
+    import json
+
+    try:
+        data = read_program(local_path)
+        logger.info("📊 Таблица прочитана:")
+        logger.info(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.exception(f"Ошибка при парсинге docx: {e}")
+    # ==== УДАЛИТЬ ====
+
+    # Отправляем обратно исходный файл (пока как smoke-test)
     processed_path = DATA_DIR / f"processed_{local_name}"
     processed_path.write_bytes(local_path.read_bytes())
-
     await message.reply_document(
         document=processed_path.open("rb"),
         filename=processed_path.name,
-        caption="✅ Файл принят и возвращён обратно (smoke-test).",
+        caption="✅ Файл получен, таблица успешно прочитана (см. логи Koyeb).",
     )
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
