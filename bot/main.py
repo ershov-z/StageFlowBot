@@ -1,13 +1,37 @@
 import os
-import asyncio
 from datetime import datetime
 from pathlib import Path
+from threading import Thread
 
 from dotenv import load_dotenv
 from loguru import logger
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+# ==== Опционально: простой HTTP-сервер для health-check Koyeb ====
+# Если в Koyeb настроен TCP health check на порт 8000, этот сервер позволит проверку пройти.
+ENABLE_HEALTH_SERVER = True
+HEALTH_PORT = int(os.getenv("PORT", "8000"))
+def start_health_server():
+    if not ENABLE_HEALTH_SERVER:
+        return
+    try:
+        from flask import Flask
+    except Exception:
+        logger.warning("Flask не установлен — health-check сервер отключён")
+        return
+    app = Flask(__name__)
+
+    @app.get("/")
+    def ok():
+        return "OK", 200
+
+    def run():
+        # use_reloader=False, чтобы не плодить процессы
+        app.run(host="0.0.0.0", port=HEALTH_PORT, use_reloader=False)
+
+    Thread(target=run, daemon=True).start()
+    logger.info(f"Health-check сервер слушает порт {HEALTH_PORT}")
 
 # ==== Пути и директории ====
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,12 +40,9 @@ LOGS_DIR = ROOT / "logs"
 DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
-
 # ==== Настройка логов ====
-logger.remove()  # убираем дефолтный sink
-# лог в консоль
+logger.remove()
 logger.add(lambda msg: print(msg, end=""), colorize=True, level="INFO")
-# лог в файл с ротацией
 logger.add(
     LOGS_DIR / "bot_{time:YYYYMMDD}.log",
     rotation="10 MB",
@@ -32,31 +53,25 @@ logger.add(
     diagnose=True,
 )
 
-
-# ==== Настройки окружения ====
-load_dotenv()  # локально читаем .env
+# ==== Окружение ====
+load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 if not TELEGRAM_TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN не найден. Добавь его в .env или переменные окружения Render.")
+    logger.error("❌ TELEGRAM_TOKEN не найден. Добавь его в переменные окружения.")
     raise SystemExit(1)
-
 
 WELCOME_TEXT = (
     "👋 Привет! Отправьте мне вашу концертную программу (.docx).\n\n"
     "Я сохраню файл, залогирую и верну обработанную версию для проверки."
 )
 
-
-# ==== Команды и обработчики ====
+# ==== Хендлеры ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    logger.info(f"/start от @{user.username} (id={user.id})")
+    logger.info(f"/start от @{getattr(user, 'username', None)} (id={user.id})")
     await update.message.reply_text(WELCOME_TEXT)
 
-
 def _is_docx(document: Document) -> bool:
-    """Проверяет, является ли файл .docx"""
     return (
         document
         and (
@@ -65,29 +80,23 @@ def _is_docx(document: Document) -> bool:
         )
     )
 
-
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Основная логика при получении файла от пользователя"""
     message = update.message
     user = update.effective_user
-
     if not message or not message.document:
         return
 
     doc: Document = message.document
-
     if not _is_docx(doc):
-        logger.info(f"Пользователь @{user.username} прислал не .docx: {doc.file_name} ({doc.mime_type})")
-        await message.reply_text("⚠️ Мне нужен именно .docx файл. Отправьте документ Word.")
+        logger.info(f"Пользователь @{getattr(user, 'username', None)} прислал не .docx: {doc.file_name} ({doc.mime_type})")
+        await message.reply_text("⚠️ Нужен .docx файл. Отправьте документ Word.")
         return
 
-    # логируем метаданные файла
     logger.info(
-        f"Получен .docx от @{user.username} (id={user.id}): "
+        f"Получен .docx от @{getattr(user, 'username', None)} (id={user.id}): "
         f"name='{doc.file_name}', size={doc.file_size} bytes, mime='{doc.mime_type}'"
     )
 
-    # скачиваем файл во временную директорию
     file = await context.bot.get_file(doc.file_id)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_name = f"{timestamp}__{doc.file_name or 'program.docx'}"
@@ -95,8 +104,6 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await file.download_to_drive(local_path.as_posix())
     logger.info(f"📥 Файл сохранён: {local_path}")
 
-    # === Здесь позже появится реальная обработка docx ===
-    # пока делаем "эхо" — просто копируем как processed
     processed_path = DATA_DIR / f"processed_{local_name}"
     try:
         processed_path.write_bytes(local_path.read_bytes())
@@ -106,27 +113,26 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text("❌ Ошибка при обработке файла.")
         return
 
-    # отправляем пользователю результат
     try:
         await message.reply_document(
             document=processed_path.open("rb"),
             filename=processed_path.name,
-            caption="✅ Файл получен и возвращён обратно.\n(Базовая проверка работы бота.)",
+            caption="✅ Файл получен и возвращён обратно. (Smoke-test)",
         )
-        logger.info(f"📤 Файл отправлен обратно пользователю @{user.username}")
+        logger.info(f"📤 Файл отправлен пользователю @{getattr(user, 'username', None)}")
     except Exception as e:
         logger.exception(f"Ошибка при отправке файла: {e}")
         await message.reply_text("Файл обработан, но не удалось отправить обратно.")
 
-
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Глобальный перехватчик ошибок"""
     logger.exception(f"Исключение в обработчике: {context.error}")
 
-
-# ==== Основной цикл приложения ====
-async def main() -> None:
+# ==== Запуск приложения (СИНХРОННЫЙ) ====
+def main() -> None:
     logger.info("🚀 Запуск Telegram-бота...")
+
+    # опционально поднимем health-check сервер для Koyeb
+    start_health_server()
 
     app = (
         Application.builder()
@@ -140,22 +146,12 @@ async def main() -> None:
     app.add_error_handler(on_error)
 
     logger.info("📡 Переходим в режим polling...")
-    await app.run_polling(
+    # ВАЖНО: это синхронный вызов, без await/asyncio.run
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        close_loop=False,
         drop_pending_updates=True,
     )
 
-
-# ==== Точка входа ====
+# ==== Точкаs входа ====
 if __name__ == "__main__":
-    import asyncio
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Остановка по Ctrl+C")
-    finally:
-        loop.close()
+    main()
