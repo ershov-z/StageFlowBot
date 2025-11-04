@@ -34,6 +34,7 @@ def start_health_server():
     Thread(target=run, daemon=True).start()
     logger.info(f"✅ Health-check сервер запущен на порту {HEALTH_PORT}")
 
+
 # ==== Пути и логирование ====
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -60,7 +61,7 @@ if not TELEGRAM_TOKEN:
 
 WELCOME_TEXT = (
     "👋 Привет! Отправьте мне вашу концертную программу (.docx).\n\n"
-    "Я прочитаю таблицу, залогирую её структуру и верну файл обратно для проверки."
+    "Я распознаю таблицу и проверю логические правила между номерами."
 )
 
 # ==== Хендлеры ====
@@ -68,6 +69,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"/start от @{getattr(user, 'username', None)} (id={user.id})")
     await update.message.reply_text(WELCOME_TEXT)
+
 
 def _is_docx(document: Document) -> bool:
     """Проверяет, является ли файл DOCX."""
@@ -78,6 +80,7 @@ def _is_docx(document: Document) -> bool:
             or (document.mime_type or "").endswith("wordprocessingml.document")
         )
     )
+
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка загруженного .docx файла."""
@@ -100,8 +103,9 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(local_path.as_posix())
     logger.info(f"📥 Файл сохранён: {local_path}")
 
-    # ==== УДАЛИТЬ (тест docx_reader) ====
+    # ==== УДАЛИТЬ (тест docx_reader + validator) ====
     from utils.docx_reader import read_program
+    from core.validator import can_follow
     import json
 
     def make_json_safe(obj):
@@ -111,10 +115,21 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         data = read_program(local_path)
-        logger.info("📊 Таблица успешно прочитана:")
+        logger.info(f"✅ Таблица успешно прочитана: {len(data)} номеров")
         logger.info(json.dumps(data, indent=2, ensure_ascii=False, default=make_json_safe))
+
+        # --- проверяем пары номеров валидатором ---
+        logger.info("🔍 Проверка правил между соседними номерами:")
+        for i in range(len(data) - 1):
+            a, b = data[i], data[i + 1]
+            result = can_follow(a, b, tyanuchka_between=False)
+            if result.ok:
+                logger.info(f"✅ {a['title']} → {b['title']} — корректно")
+            else:
+                logger.warning(f"⚠️ {a['title']} → {b['title']} — конфликт: {result.reasons}")
+
     except Exception as e:
-        logger.exception(f"Ошибка при парсинге docx: {e}")
+        logger.exception(f"Ошибка при обработке docx: {e}")
     # ==== УДАЛИТЬ ====
 
     # Отправляем обратно исходный файл (временно)
@@ -123,12 +138,14 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_document(
         document=processed_path.open("rb"),
         filename=processed_path.name,
-        caption="✅ Таблица успешно распознана. Проверь логи Koyeb для детальной структуры.",
+        caption="✅ Таблица распознана и проверена. См. логи Koyeb для отчёта.",
     )
+
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Глобальный обработчик ошибок."""
     logger.exception(f"Ошибка в обработчике: {context.error}")
+
 
 # ==== Запуск ====
 def main() -> None:
@@ -142,6 +159,7 @@ def main() -> None:
 
     logger.info("📡 Переходим в режим polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
