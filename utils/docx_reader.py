@@ -1,29 +1,28 @@
 from docx import Document
 from loguru import logger
 
-
-def _extract_text_with_breaks(cell):
+# === Вспомогательная функция для полного извлечения текста с \n из ячейки ===
+def _extract_text_with_real_breaks(cell):
     """
-    Извлекает текст из ячейки таблицы, включая символы перевода строки (<w:br/>).
-    Это критично для корректного разделения актёров.
+    Извлекает текст из ячейки таблицы, включая <w:br/> и <w:p>.
+    Это гарантирует сохранение переводов строк.
     """
-    lines = []
-    for paragraph in cell.paragraphs:
-        text = ""
-        for run in paragraph.runs:
-            text += run.text
-            # Добавляем перенос, если в run есть <w:br/> (внутренние переносы в docx)
-            if run._element.xpath(".//w:br"):
-                text += "\n"
-        lines.append(text)
-    return "\n".join(lines).strip()
+    texts = []
+    for paragraph in cell._element.xpath(".//w:p", namespaces=cell._element.nsmap):
+        line = ""
+        for node in paragraph.xpath(".//w:r", namespaces=cell._element.nsmap):
+            # Добавляем текст
+            for t in node.xpath(".//w:t", namespaces=cell._element.nsmap):
+                line += t.text or ""
+            # Добавляем перенос при наличии <w:br/>
+            if node.xpath(".//w:br", namespaces=cell._element.nsmap):
+                line += "\n"
+        texts.append(line.strip())
+    return "\n".join([t for t in texts if t]).strip()
 
 
 def _split_people_blob(blob: str) -> list[str]:
-    """
-    Надёжно разбиваем строку актёров: поддерживаем \\n, ',', ';', '/', '\\'.
-    Ничего не делим по пробелам, чтобы не ломать фразы типа 'Женщина 50+'.
-    """
+    """Разбиваем строку актёров на имена."""
     if not blob:
         return []
     raw = (
@@ -32,30 +31,29 @@ def _split_people_blob(blob: str) -> list[str]:
         .replace("/", "\n")
         .replace("\\", "\n")
     )
-    out: list[str] = []
+    result = []
     for line in raw.split("\n"):
         for piece in line.split(","):
             piece = piece.strip()
             if piece:
-                out.append(piece)
-    return out
+                result.append(piece)
+    return result
 
 
 def parse_actors(raw: str) -> list[dict]:
     """
-    Разбирает строку актёров и выделяет теги:
-      %  -> 'later'
-      !  -> 'early'
-      (гк) -> 'gk'  (приоритетно)
-    Тегов может быть несколько (например 'Брекоткин%%!').
+    Разбирает строку актёров и теги:
+      % → later
+      ! → early
+      (гк) → gk
     """
     if not raw:
         return []
 
-    result: list[dict] = []
+    result = []
     for token in _split_people_blob(raw):
         name = token.strip()
-        tags: set[str] = set()
+        tags = set()
 
         lname = name.lower()
         if "(гк)" in lname or "(г к)" in lname:
@@ -84,9 +82,7 @@ def parse_actors(raw: str) -> list[dict]:
 
 
 def read_program(path: str):
-    """
-    Считывает первую таблицу из .docx и возвращает список номеров.
-    """
+    """Парсит таблицу программы из docx."""
     logger.info(f"📄 Чтение документа: {path}")
     doc = Document(path)
 
@@ -97,15 +93,9 @@ def read_program(path: str):
     table = doc.tables[0]
     data = []
 
-    rows = table.rows
-    if not rows or len(rows) < 2:
-        logger.error("❌ Таблица пустая или без данных.")
-        return []
-
-    for i, row in enumerate(rows[1:], start=1):
+    for i, row in enumerate(table.rows[1:], start=1):
         cells = row.cells
-        texts = [_extract_text_with_breaks(c) for c in cells]
-
+        texts = [_extract_text_with_real_breaks(c) for c in cells]
         if not any(texts):
             continue
 
@@ -115,8 +105,9 @@ def read_program(path: str):
         pp = texts[3] if len(texts) > 3 else ""
         hire = texts[4] if len(texts) > 4 else ""
         responsible = texts[5] if len(texts) > 5 else ""
-        kv_cell = texts[6] if len(texts) > 6 else ""
-        kv = "кв" in kv_cell.lower()
+        kv = False
+        if len(texts) > 6:
+            kv = "кв" in texts[6].lower()
 
         entry = {
             "order": i,
@@ -148,6 +139,7 @@ def read_program(path: str):
 # ==== УДАЛИТЬ (локальная проверка) ====
 if __name__ == "__main__":
     import json
-    res = read_program("data/sample.docx")
+    path = "data/sample.docx"
+    res = read_program(path)
     print(json.dumps(res, indent=2, ensure_ascii=False))
 # ==== УДАЛИТЬ ====
