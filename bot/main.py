@@ -150,17 +150,9 @@ async def main() -> None:
 # ==== Точка входа ====
 if __name__ == "__main__":
     import asyncio
-    import sys
 
     try:
-        # Для Windows Telegram-бота запускаем только в отдельном процессе,
-        # никакие патчи nest_asyncio не применяем.
         asyncio.run(main())
-    except RuntimeError as e:
-        print("\n❌ Ошибка цикла asyncio. "
-              "Запусти эту команду в отдельном окне PowerShell, "
-              "а не через VS Code / IPython.")
-        print(e)
-        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("🛑 Остановка по Ctrl+C")
+
