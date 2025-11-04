@@ -13,6 +13,7 @@ ENABLE_HEALTH_SERVER = True
 HEALTH_PORT = int(os.getenv("PORT", "8000"))
 
 def start_health_server():
+    """Простой Flask-сервер для health-check Koyeb."""
     if not ENABLE_HEALTH_SERVER:
         return
     try:
@@ -31,9 +32,9 @@ def start_health_server():
         app.run(host="0.0.0.0", port=HEALTH_PORT, use_reloader=False)
 
     Thread(target=run, daemon=True).start()
-    logger.info(f"Health-check сервер запущен на порту {HEALTH_PORT}")
+    logger.info(f"✅ Health-check сервер запущен на порту {HEALTH_PORT}")
 
-# ==== Пути и логи ====
+# ==== Пути и логирование ====
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 LOGS_DIR = ROOT / "logs"
@@ -59,7 +60,7 @@ if not TELEGRAM_TOKEN:
 
 WELCOME_TEXT = (
     "👋 Привет! Отправьте мне вашу концертную программу (.docx).\n\n"
-    "Я сохраню файл, залогирую и верну обработанную версию для проверки."
+    "Я прочитаю таблицу, залогирую её структуру и верну файл обратно для проверки."
 )
 
 # ==== Хендлеры ====
@@ -69,6 +70,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME_TEXT)
 
 def _is_docx(document: Document) -> bool:
+    """Проверяет, является ли файл DOCX."""
     return (
         document
         and (
@@ -78,6 +80,7 @@ def _is_docx(document: Document) -> bool:
     )
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка загруженного .docx файла."""
     message = update.message
     user = update.effective_user
     if not message or not message.document:
@@ -88,37 +91,43 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ Отправь, пожалуйста, .docx файл.")
         return
 
-    logger.info(f"Получен .docx от @{getattr(user, 'username', None)}: {doc.file_name}")
+    logger.info(f"📄 Получен .docx от @{getattr(user, 'username', None)}: {doc.file_name}")
 
     file = await context.bot.get_file(doc.file_id)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_name = f"{timestamp}__{doc.file_name or 'program.docx'}"
     local_path = DATA_DIR / local_name
     await file.download_to_drive(local_path.as_posix())
-    logger.info(f"📥 Сохранён файл: {local_path}")
+    logger.info(f"📥 Файл сохранён: {local_path}")
 
     # ==== УДАЛИТЬ (тест docx_reader) ====
     from utils.docx_reader import read_program
     import json
 
+    def make_json_safe(obj):
+        if isinstance(obj, set):
+            return list(obj)
+        raise TypeError(f"Type {type(obj)} not serializable")
+
     try:
         data = read_program(local_path)
-        logger.info("📊 Таблица прочитана:")
-        logger.info(json.dumps(data, indent=2, ensure_ascii=False))
+        logger.info("📊 Таблица успешно прочитана:")
+        logger.info(json.dumps(data, indent=2, ensure_ascii=False, default=make_json_safe))
     except Exception as e:
         logger.exception(f"Ошибка при парсинге docx: {e}")
     # ==== УДАЛИТЬ ====
 
-    # Отправляем обратно исходный файл (пока как smoke-test)
+    # Отправляем обратно исходный файл (временно)
     processed_path = DATA_DIR / f"processed_{local_name}"
     processed_path.write_bytes(local_path.read_bytes())
     await message.reply_document(
         document=processed_path.open("rb"),
         filename=processed_path.name,
-        caption="✅ Файл получен, таблица успешно прочитана (см. логи Koyeb).",
+        caption="✅ Таблица успешно распознана. Проверь логи Koyeb для детальной структуры.",
     )
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик ошибок."""
     logger.exception(f"Ошибка в обработчике: {context.error}")
 
 # ==== Запуск ====
@@ -127,7 +136,6 @@ def main() -> None:
     start_health_server()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
     app.add_error_handler(on_error)
