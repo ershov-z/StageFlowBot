@@ -3,6 +3,8 @@
 import copy
 import random
 from loguru import logger
+from main import send_message  # ✅ используется существующая функция для отправки сообщений в Telegram
+
 
 # ============================================================
 # 🔧 Вспомогательные проверки
@@ -251,6 +253,13 @@ def _insert_tyanuchki(program, max_tyanuchki=3):
 
 def generate_program_variants(program, top_n=5):
     logger.info("🧩 Генерация вариантов программы...")
+
+    # ✅ Отправляем уведомление пользователю перед началом перебора
+    try:
+        send_message("Начат подбор вариантов! Обычно этот процесс занимает пару минут, ожидайте.")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
+
     if not program or len(program) < 2:
         base = _count_conflicts(program)
         return [program], {"checked_variants": 0, "initial_conflicts": base,
