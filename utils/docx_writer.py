@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 from typing import Iterable, List, Tuple, Optional
+from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.oxml import OxmlElement
@@ -85,11 +86,25 @@ def _split_actors_for_columns(actors_raw: str, pp_field: str) -> Tuple[List[str]
 # 🧩 ОСНОВНАЯ ФУНКЦИЯ
 # ============================================================
 
-def save_program_to_docx(program_data: Iterable[dict], output_path: str, template_path: Optional[str] = None):
+def save_program_to_docx(
+    program_data: Iterable[dict],
+    output_path: str,
+    template_path: Optional[str] = None,
+    original_filename: Optional[str] = None
+):
     """
     Генерирует DOCX с колонками:
     № | Название | Актёры | ПП | Найм | Ответственный | КВ
+
+    🔹 Если передано имя исходного файла — итоговый DOCX получит суффикс "_ershobot".
+       Например: "Программа_концерта.docx" → "Программа_концерта_ershobot.docx"
     """
+    # Формируем итоговый путь
+    if original_filename:
+        base = Path(original_filename).stem
+        out_dir = Path(output_path).parent
+        output_path = out_dir / f"{base}_ershobot.docx"
+
     doc = Document(template_path) if template_path else Document()
     doc.add_heading("Программа концерта", level=1)
 
@@ -107,8 +122,6 @@ def save_program_to_docx(program_data: Iterable[dict], output_path: str, templat
     for item in program_data:
         row = table.add_row()
         cells = row.cells
-
-        # Полная очистка ячеек
         for c in cells:
             _clear_cell(c)
 
@@ -150,8 +163,6 @@ def save_program_to_docx(program_data: Iterable[dict], output_path: str, templat
         for i, w in enumerate(widths):
             row.cells[i].width = w
 
-    doc.add_paragraph("")  # один отступ после таблицы
-    doc.add_paragraph("Файл автоматически сгенерирован StageFlowBot", style="Intense Quote")
-
+    # Сохраняем без подписи
     doc.save(output_path)
-    return output_path
+    return str(output_path)
