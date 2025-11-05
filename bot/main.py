@@ -1,164 +1,106 @@
 import os
+import json
 from datetime import datetime
-from pathlib import Path
-from threading import Thread
-
-from dotenv import load_dotenv
+from flask import Flask
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from loguru import logger
-from telegram import Update, Document
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ==== Health-check сервер для Koyeb ====
-ENABLE_HEALTH_SERVER = True
-HEALTH_PORT = int(os.getenv("PORT", "8000"))
+# === Импорт парсера ===
+from utils.docx_reader import read_program
+logger.info(f"✅ Импортирован read_program из: {getattr(read_program, '__code__', None) and read_program.__code__.co_filename}")
+
+# === Конфигурация ===
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATA_DIR = os.path.join(os.getcwd(), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+LOG_DIR = os.path.join(os.getcwd(), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger.add(os.path.join(LOG_DIR, "bot_{time:YYYYMMDD}.log"), rotation="5 MB", retention="10 days")
+
+# === Flask для health-check (Koyeb требует HTTP-сервер) ===
+app_health = Flask(__name__)
+
+@app_health.route("/")
+def index():
+    return "Bot is alive!"
 
 def start_health_server():
-    """Простой Flask-сервер для health-check Koyeb."""
-    if not ENABLE_HEALTH_SERVER:
-        return
-    try:
-        from flask import Flask
-    except ImportError:
-        logger.warning("Flask не установлен — health-check сервер отключён")
-        return
-
-    app = Flask(__name__)
-
-    @app.get("/")
-    def ok():
-        return "OK", 200
-
+    """Запуск health-check Flask-сервера"""
+    from threading import Thread
     def run():
-        app.run(host="0.0.0.0", port=HEALTH_PORT, use_reloader=False)
-
+        logger.info("🌐 Запуск health-check сервера на порту 8000")
+        app_health.run(host="0.0.0.0", port=8000, debug=False)
     Thread(target=run, daemon=True).start()
-    logger.info(f"✅ Health-check сервер запущен на порту {HEALTH_PORT}")
 
 
-# ==== Пути и логирование ====
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
-LOGS_DIR = ROOT / "logs"
-DATA_DIR.mkdir(exist_ok=True)
-LOGS_DIR.mkdir(exist_ok=True)
-
-logger.remove()
-logger.add(lambda msg: print(msg, end=""), colorize=True, level="INFO")
-logger.add(
-    LOGS_DIR / "bot_{time:YYYYMMDD}.log",
-    rotation="10 MB",
-    retention="10 days",
-    level="INFO",
-    encoding="utf-8",
-)
-
-# ==== Токен ====
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN не найден!")
-    raise SystemExit(1)
-
-WELCOME_TEXT = (
-    "👋 Привет! Отправьте мне вашу концертную программу (.docx).\n\n"
-    "Я распознаю таблицу и проверю логические правила между номерами."
-)
-
-# ==== Хендлеры ====
+# === Хендлеры ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"/start от @{getattr(user, 'username', None)} (id={user.id})")
-    await update.message.reply_text(WELCOME_TEXT)
-
-
-def _is_docx(document: Document) -> bool:
-    """Проверяет, является ли файл DOCX."""
-    return (
-        document
-        and (
-            (document.file_name or "").lower().endswith(".docx")
-            or (document.mime_type or "").endswith("wordprocessingml.document")
-        )
+    logger.info(f"/start от @{user.username} (id={user.id})")
+    await update.message.reply_text(
+        "Привет! Отправь мне .docx файл с программой, и я её разберу. 📄"
     )
 
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка загруженного .docx файла."""
-    message = update.message
+    """Обрабатывает загруженный DOCX-файл"""
     user = update.effective_user
-    if not message or not message.document:
+    document = update.message.document
+
+    if not document or not document.file_name.endswith(".docx"):
+        await update.message.reply_text("Отправь, пожалуйста, именно .docx файл.")
         return
 
-    doc: Document = message.document
-    if not _is_docx(doc):
-        await message.reply_text("⚠️ Отправь, пожалуйста, .docx файл.")
-        return
-
-    logger.info(f"📄 Получен .docx от @{getattr(user, 'username', None)}: {doc.file_name}")
-
-    file = await context.bot.get_file(doc.file_id)
+    file = await document.get_file()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    local_name = f"{timestamp}__{doc.file_name or 'program.docx'}"
-    local_path = DATA_DIR / local_name
-    await file.download_to_drive(local_path.as_posix())
-    logger.info(f"📥 Файл сохранён: {local_path}")
+    filename = f"{timestamp}__{document.file_name}"
+    save_path = os.path.join(DATA_DIR, filename)
 
-    # ==== УДАЛИТЬ (тест docx_reader + validator) ====
-    from utils.docx_reader import read_program
-    from core.validator import can_follow
-    import json
+    logger.info(f"📄 Получен .docx от @{user.username}: {document.file_name}")
+    await file.download_to_drive(save_path)
+    logger.info(f"📥 Файл сохранён: {save_path}")
 
-    def make_json_safe(obj):
-        if isinstance(obj, set):
-            return list(obj)
-        raise TypeError(f"Type {type(obj)} not serializable")
-
+    # --- Парсинг файла ---
     try:
-        data = read_program(local_path)
-        logger.info(f"✅ Таблица успешно прочитана: {len(data)} номеров")
-        logger.info(json.dumps(data, indent=2, ensure_ascii=False, default=make_json_safe))
+        data = read_program(save_path)
+        if not data:
+            await update.message.reply_text("❌ Не удалось прочитать таблицу из файла.")
+            return
 
-        # --- проверяем пары номеров валидатором ---
-        logger.info("🔍 Проверка правил между соседними номерами:")
-        for i in range(len(data) - 1):
-            a, b = data[i], data[i + 1]
-            result = can_follow(a, b, tyanuchka_between=False)
-            if result.ok:
-                logger.info(f"✅ {a['title']} → {b['title']} — корректно")
-            else:
-                logger.warning(f"⚠️ {a['title']} → {b['title']} — конфликт: {result.reasons}")
+        logger.info("📊 Таблица успешно прочитана:")
+        logger.info(json.dumps(data, indent=2, ensure_ascii=False))
+
+        # Отправим пользователю краткий результат
+        msg_preview = "\n".join([f"{row['num']} {row['title']}" for row in data[:10]])
+        await update.message.reply_text(
+            f"✅ Прочитано {len(data)} строк из файла '{document.file_name}'.\n"
+            f"Пример:\n{msg_preview}"
+        )
 
     except Exception as e:
-        logger.exception(f"Ошибка при обработке docx: {e}")
-    # ==== УДАЛИТЬ ====
-
-    # Отправляем обратно исходный файл (временно)
-    processed_path = DATA_DIR / f"processed_{local_name}"
-    processed_path.write_bytes(local_path.read_bytes())
-    await message.reply_document(
-        document=processed_path.open("rb"),
-        filename=processed_path.name,
-        caption="✅ Таблица распознана и проверена. См. логи Koyeb для отчёта.",
-    )
+        logger.exception("Ошибка при парсинге docx")
+        await update.message.reply_text(f"❌ Ошибка при обработке файла: {e}")
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок."""
-    logger.exception(f"Ошибка в обработчике: {context.error}")
-
-
-# ==== Запуск ====
-def main() -> None:
+# === Основная функция ===
+def main():
     logger.info("🚀 Запуск Telegram-бота...")
+
+    if not TOKEN:
+        logger.error("❌ Не найден BOT_TOKEN в переменных окружения.")
+        return
+
     start_health_server()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
-    app.add_error_handler(on_error)
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
 
     logger.info("📡 Переходим в режим polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
