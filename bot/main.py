@@ -1,106 +1,125 @@
 import os
+import sys
 import json
-from datetime import datetime
-from flask import Flask
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import tempfile
+from pathlib import Path
 from loguru import logger
-
-# === Импорт парсера ===
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from utils.docx_reader import read_program
-logger.info(f"✅ Импортирован read_program из: {getattr(read_program, '__code__', None) and read_program.__code__.co_filename}")
+from utils.validator import generate_program_variants
+from utils.docx_writer import save_program_to_docx  # появится позже, пока можно закомментировать
 
-# === Конфигурация ===
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-DATA_DIR = os.path.join(os.getcwd(), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-LOG_DIR = os.path.join(os.getcwd(), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+# ============================================================
+# 🔧 НАСТРОЙКА ЛОГИРОВАНИЯ
+# ============================================================
 
-logger.add(os.path.join(LOG_DIR, "bot_{time:YYYYMMDD}.log"), rotation="5 MB", retention="10 days")
+os.makedirs("logs", exist_ok=True)
+logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="INFO")
 
-# === Flask для health-check (Koyeb требует HTTP-сервер) ===
-app_health = Flask(__name__)
+# ============================================================
+# 🔹 ИНИЦИАЛИЗАЦИЯ БОТА
+# ============================================================
 
-@app_health.route("/")
-def index():
-    return "Bot is alive!"
-
-def start_health_server():
-    """Запуск health-check Flask-сервера"""
-    from threading import Thread
-    def run():
-        logger.info("🌐 Запуск health-check сервера на порту 8000")
-        app_health.run(host="0.0.0.0", port=8000, debug=False)
-    Thread(target=run, daemon=True).start()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
+TOKEN = TELEGRAM_TOKEN.strip()
+if not TOKEN:
+    logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN).")
+    sys.exit(1)
+else:
+    logger.info(f"🔑 Токен найден, длина: {len(TOKEN)}")
 
 
-# === Хендлеры ===
+# ============================================================
+# 🔹 ОБРАБОТЧИКИ
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
-        "Привет! Отправь мне .docx файл с программой, и я её разберу. 📄"
+        "👋 Привет! Отправь мне .docx с программой концерта — я проверю, соберу и при необходимости добавлю тянучки."
     )
 
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает загруженный DOCX-файл"""
+    """Получает docx, парсит, валидирует и возвращает результат"""
     user = update.effective_user
     document = update.message.document
 
-    if not document or not document.file_name.endswith(".docx"):
-        await update.message.reply_text("Отправь, пожалуйста, именно .docx файл.")
+    if not document.file_name.lower().endswith(".docx"):
+        await update.message.reply_text("⚠️ Отправь файл в формате .docx, пожалуйста.")
         return
 
-    file = await document.get_file()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}__{document.file_name}"
-    save_path = os.path.join(DATA_DIR, filename)
-
     logger.info(f"📄 Получен .docx от @{user.username}: {document.file_name}")
-    await file.download_to_drive(save_path)
-    logger.info(f"📥 Файл сохранён: {save_path}")
+    file = await document.get_file()
 
-    # --- Парсинг файла ---
+    os.makedirs("data", exist_ok=True)
+    local_path = Path(f"data/{Path(document.file_name).stem}_{user.id}.docx")
+    await file.download_to_drive(local_path)
+    logger.info(f"📥 Файл сохранён: {local_path}")
+
     try:
-        data = read_program(save_path)
-        if not data:
-            await update.message.reply_text("❌ Не удалось прочитать таблицу из файла.")
-            return
-
-        logger.info("📊 Таблица успешно прочитана:")
+        # 1️⃣ Парсинг
+        data = read_program(local_path)
+        logger.info(f"✅ Успешно извлечено {len(data)} строк.")
         logger.info(json.dumps(data, indent=2, ensure_ascii=False))
 
-        # Отправим пользователю краткий результат
-        msg_preview = "\n".join([f"{row['num']} {row['title']}" for row in data[:10]])
-        await update.message.reply_text(
-            f"✅ Прочитано {len(data)} строк из файла '{document.file_name}'.\n"
-            f"Пример:\n{msg_preview}"
+        # 2️⃣ Генерация вариантов
+        variants, tcount = generate_program_variants(data)
+
+        if not variants:
+            await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
+            return
+
+        result = variants[0]  # берём первый корректный вариант
+        msg = (
+            f"✅ Программа успешно собрана!\n"
+            f"Добавлено тянучек: {tcount}.\n"
+            f"Всего номеров: {len(result)}."
         )
 
+        # 3️⃣ Логирование результата
+        logger.info(f"🎬 Итоговый вариант с {tcount} тянучками сформирован.")
+
+        # 4️⃣ Сохранение в новый DOCX (если реализовано)
+        # result_path = save_program_to_docx(result, f"data/output_{user.id}.docx")
+        # await update.message.reply_document(open(result_path, "rb"), caption=msg)
+
+        # Пока просто возвращаем JSON
+        pretty = json.dumps(result, indent=2, ensure_ascii=False)
+        await update.message.reply_text(msg)
+        logger.debug(pretty)
+
     except Exception as e:
-        logger.exception("Ошибка при парсинге docx")
+        logger.exception(f"Ошибка при обработке docx: {e}")
         await update.message.reply_text(f"❌ Ошибка при обработке файла: {e}")
 
 
-# === Основная функция ===
+# ============================================================
+# 🔹 ОСНОВНОЙ ЗАПУСК
+# ============================================================
+
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
 
-    if not TOKEN:
-        logger.error("❌ Не найден BOT_TOKEN в переменных окружения.")
-        return
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
 
-    start_health_server()
-
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
 
     logger.info("📡 Переходим в режим polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
