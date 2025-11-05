@@ -15,7 +15,6 @@ def has_conflict(item_a, item_b):
     if "Все" in actors_a or "Все" in actors_b:
         return False
 
-    # Конфликт, если один и тот же актёр идёт подряд, и у него нет тега (гк)
     common = actors_a & actors_b
     if not common:
         return False
@@ -52,6 +51,7 @@ def make_tyanuchka(between_a, between_b, used_pull=None):
                 "type": "тянучка",
                 "actors": [{"name": cand, "tags": []}],
             }
+
     # fallback
     return {
         "order": None,
@@ -73,8 +73,9 @@ def make_tyanuchka(between_a, between_b, used_pull=None):
 
 def generate_program_variants(program):
     """
-    Перебирает все допустимые перестановки номеров, выбирает вариант
-    с минимальным числом конфликтов, вставляет тянучки при необходимости.
+    Перебирает все допустимые перестановки номеров,
+    выбирает вариант с минимальным числом конфликтов,
+    вставляет тянучки при необходимости.
     """
 
     logger.info("🧩 Запуск валидации программы...")
@@ -98,16 +99,16 @@ def generate_program_variants(program):
         f"переставляемых: {len(movable)}"
     )
 
-    # 2️⃣ Собираем все возможные перестановки переставляемых элементов
     movable_items = [x[1] for x in movable]
     permutations = list(itertools.permutations(movable_items))
-    logger.info(f"🔄 Всего перестановок для проверки: {len(permutations)}")
+    total_checked = len(permutations)
+    logger.info(f"🔄 Всего перестановок для проверки: {total_checked}")
 
     best_variant = None
     min_conflicts = float("inf")
 
-    # 3️⃣ Проверяем каждую перестановку
-    for perm in permutations:
+    # 2️⃣ Проверяем каждую перестановку
+    for perm_index, perm in enumerate(permutations, 1):
         candidate = deepcopy(program)
         movable_iter = iter(perm)
         for idx, _ in movable:
@@ -122,22 +123,29 @@ def generate_program_variants(program):
         if conflicts < min_conflicts:
             best_variant = candidate
             min_conflicts = conflicts
+            logger.debug(f"🔎 Новая лучшая перестановка #{perm_index}: {conflicts} конфликтов")
 
-        # Если нашли идеальный вариант — можно прекратить
         if min_conflicts == 0:
+            logger.info(f"✅ Найден идеальный вариант без конфликтов на перестановке #{perm_index}")
             break
 
-    # 4️⃣ Если лучший вариант найден
     if best_variant is None:
         logger.error("❌ Не удалось сгенерировать перестановки.")
-        return [], 0
+        return [], {
+            "initial_conflicts": 0,
+            "final_conflicts": 0,
+            "tyanuchki_added": 0,
+            "checked_variants": total_checked,
+        }
 
     logger.info(f"🎯 Лучшая перестановка найдена, конфликтов: {min_conflicts}")
 
-    # 5️⃣ Добавляем тянучки при конфликтах
+    # 3️⃣ Добавляем тянучки при конфликтах
     result = []
     used_pull = set()
     tcount = 0
+    conflicts_before = 0
+    conflicts_after = 0
 
     for i in range(len(best_variant) - 1):
         a = best_variant[i]
@@ -145,12 +153,22 @@ def generate_program_variants(program):
         result.append(a)
 
         if has_conflict(a, b):
+            conflicts_before += 1
             tyan = make_tyanuchka(a, b, used_pull)
             result.append(tyan)
             tcount += 1
             logger.info(f"➕ Добавлена тянучка между «{a['title']}» и «{b['title']}».")
+        else:
+            logger.debug(f"✅ Без конфликта: {a['title']} → {b['title']}")
 
     result.append(best_variant[-1])
 
     logger.success(f"✅ Программа собрана. Тянучек добавлено: {tcount}")
-    return [result], tcount
+    stats = {
+        "initial_conflicts": min_conflicts,
+        "final_conflicts": 0,
+        "tyanuchki_added": tcount,
+        "checked_variants": total_checked,
+    }
+
+    return [result], stats

@@ -1,156 +1,139 @@
-import itertools
-from copy import deepcopy
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from loguru import logger
 
-# ============================================================
-# 🔹 Проверка конфликтов между номерами
-# ============================================================
 
-def has_conflict(item_a, item_b):
-    """Возвращает True, если между двумя номерами конфликт."""
-    actors_a = {a["name"] for a in item_a.get("actors", [])}
-    actors_b = {a["name"] for a in item_b.get("actors", [])}
+# ==============================================================
+# 🔹 Стили и утилиты
+# ==============================================================
 
-    # Игнорируем "Все"
-    if "Все" in actors_a or "Все" in actors_b:
-        return False
-
-    # Конфликт, если один и тот же актёр идёт подряд, и у него нет тега (гк)
-    common = actors_a & actors_b
-    if not common:
-        return False
-
-    # Проверяем, есть ли тег (гк)
-    for actor in item_a.get("actors", []) + item_b.get("actors", []):
-        if "gk" in actor.get("tags", []):
-            return False
-
-    return True
-
-
-# ============================================================
-# 🔹 Вставка тянучки
-# ============================================================
-
-def make_tyanuchka(between_a, between_b, used_pull=None):
-    """Создаёт тянучку между двумя конфликтующими номерами."""
-    used_pull = used_pull or set()
-    candidates = ["Пушкин", "Исаев", "Рожков"]
-
-    for cand in candidates:
-        if cand not in used_pull:
-            used_pull.add(cand)
-            return {
-                "order": None,
-                "num": "",
-                "title": f"Тянучка, ждём {cand}",
-                "actors_raw": cand,
-                "pp": "",
-                "hire": "",
-                "responsible": cand,
-                "kv": False,
-                "type": "тянучка",
-                "actors": [{"name": cand, "tags": []}],
-            }
-    # fallback
-    return {
-        "order": None,
-        "num": "",
-        "title": "Тянучка (резерв)",
-        "actors_raw": "Пушкин",
-        "pp": "",
-        "hire": "",
-        "responsible": "Пушкин",
-        "kv": False,
-        "type": "тянучка",
-        "actors": [{"name": "Пушкин", "tags": []}],
-    }
-
-
-# ============================================================
-# 🔹 Основной валидатор
-# ============================================================
-
-def generate_program_variants(program):
+def _add_shading(cell, fill="DDDDDD"):
     """
-    Перебирает все допустимые перестановки номеров, выбирает вариант
-    с минимальным числом конфликтов, вставляет тянучки при необходимости.
+    Добавляет заливку (background color) в ячейку таблицы.
+    Используем стандартный XML элемент <w:shd> вместо старого _new_shd().
     """
+    tc_pr = cell._element.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    tc_pr.append(shd)
 
-    logger.info("🧩 Запуск валидации программы...")
 
-    # 1️⃣ Разделяем неизменяемые и переставляемые блоки
-    immovable = []
-    movable = []
+def _style_header_cell(cell):
+    """Форматирует ячейку заголовка таблицы."""
+    _add_shading(cell, fill="DDDDDD")
+    for paragraph in cell.paragraphs:
+        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+        run.bold = True
+        run.font.size = Pt(10)
+        run.font.name = "Calibri"
 
-    for idx, item in enumerate(program):
-        title = item.get("title", "").lower()
-        if any(
-            key in title
-            for key in ["предкулисье", "спонсоры", "финальная", "конец"]
-        ) or idx in [0, 1, len(program) - 1, len(program) - 2]:
-            immovable.append((idx, item))
-        else:
-            movable.append((idx, item))
 
-    logger.info(
-        f"📌 Фиксированные позиции: {[i for i, _ in immovable]}, "
-        f"переставляемых: {len(movable)}"
-    )
+def _style_regular_cell(cell):
+    """Форматирует обычные ячейки таблицы."""
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(10)
+            run.font.name = "Calibri"
 
-    # 2️⃣ Собираем все возможные перестановки переставляемых элементов
-    movable_items = [x[1] for x in movable]
-    permutations = list(itertools.permutations(movable_items))
-    logger.info(f"🔄 Всего перестановок для проверки: {len(permutations)}")
 
-    best_variant = None
-    min_conflicts = float("inf")
+# ==============================================================
+# 🔹 Основная функция
+# ==============================================================
 
-    # 3️⃣ Проверяем каждую перестановку
-    for perm in permutations:
-        candidate = deepcopy(program)
-        movable_iter = iter(perm)
-        for idx, _ in movable:
-            candidate[idx] = next(movable_iter)
+def save_program_to_docx(program_data, output_path, template_path=None):
+    """
+    Сохраняет итоговую программу концерта в .docx.
+    ✅ Актёры, теги и другие данные не изменяются.
+    ✅ Меняется только порядок и возможные тянучки (добавленные валидатором).
+    """
+    try:
+        logger.info("📝 Начинаем запись итогового DOCX...")
+        doc = Document(template_path) if template_path else Document()
 
-        # Считаем количество конфликтов
-        conflicts = 0
-        for i in range(len(candidate) - 1):
-            if has_conflict(candidate[i], candidate[i + 1]):
-                conflicts += 1
+        # Заголовок
+        doc.add_heading("Программа концерта", level=1)
 
-        if conflicts < min_conflicts:
-            best_variant = candidate
-            min_conflicts = conflicts
+        # Таблица
+        table = doc.add_table(rows=1, cols=7)
+        table.style = "Table Grid"
 
-        # Если нашли идеальный вариант — можно прекратить
-        if min_conflicts == 0:
-            break
+        # Заголовки
+        headers = ["№", "Название", "Актёры", "ПП", "Ответственный", "Тип", "KV"]
+        hdr_cells = table.rows[0].cells
+        for i, text in enumerate(headers):
+            hdr_cells[i].text = text
+            _style_header_cell(hdr_cells[i])
 
-    # 4️⃣ Если лучший вариант найден
-    if best_variant is None:
-        logger.error("❌ Не удалось сгенерировать перестановки.")
-        return [], 0
+        # Добавляем строки программы
+        for item in program_data:
+            row_cells = table.add_row().cells
 
-    logger.info(f"🎯 Лучшая перестановка найдена, конфликтов: {min_conflicts}")
+            # Колонка № — сначала num, если есть, иначе order
+            num_value = str(item.get("num") or item.get("order") or "")
+            row_cells[0].text = num_value
 
-    # 5️⃣ Добавляем тянучки при конфликтах
-    result = []
-    used_pull = set()
-    tcount = 0
+            # Название
+            row_cells[1].text = str(item.get("title", "")).strip()
 
-    for i in range(len(best_variant) - 1):
-        a = best_variant[i]
-        b = best_variant[i + 1]
-        result.append(a)
+            # Актёры — каждый на новой строке
+            actors = item.get("actors", [])
+            actor_lines = []
+            for actor in actors:
+                name = actor.get("name", "")
+                tags = actor.get("tags", [])
+                if tags:
+                    tag_str = " ".join([f"({t})" for t in tags])
+                    actor_lines.append(f"{name} {tag_str}")
+                else:
+                    actor_lines.append(name)
+            row_cells[2].text = "\n".join(actor_lines)
 
-        if has_conflict(a, b):
-            tyan = make_tyanuchka(a, b, used_pull)
-            result.append(tyan)
-            tcount += 1
-            logger.info(f"➕ Добавлена тянучка между «{a['title']}» и «{b['title']}».")
+            # ПП
+            row_cells[3].text = str(item.get("pp", "")).strip()
 
-    result.append(best_variant[-1])
+            # Ответственный
+            row_cells[4].text = str(item.get("responsible", "")).strip()
 
-    logger.success(f"✅ Программа собрана. Тянучек добавлено: {tcount}")
-    return [result], tcount
+            # Тип
+            row_cells[5].text = str(item.get("type", "")).strip()
+
+            # KV (квартира)
+            row_cells[6].text = "Да" if item.get("kv") else ""
+
+            # Применяем стиль
+            for c in row_cells:
+                _style_regular_cell(c)
+
+        # Задаём ширины колонок
+        widths = [
+            Inches(0.5),  # №
+            Inches(2.2),  # Название
+            Inches(2.5),  # Актёры
+            Inches(1.2),  # ПП
+            Inches(1.5),  # Ответственный
+            Inches(1.0),  # Тип
+            Inches(0.6),  # KV
+        ]
+        for row in table.rows:
+            for i, w in enumerate(widths):
+                row.cells[i].width = w
+
+        # Добавляем подпись
+        doc.add_paragraph("")
+        doc.add_paragraph(
+            "Файл автоматически сгенерирован StageFlowBot",
+            style="Intense Quote"
+        )
+
+        # Сохраняем
+        doc.save(output_path)
+        logger.info(f"📁 DOCX сохранён: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.exception(f"Ошибка при сохранении DOCX: {e}")
+        raise e
