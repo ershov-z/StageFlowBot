@@ -3,7 +3,7 @@
 import copy
 import random
 from loguru import logger
-from main import send_message  # ✅ используется существующая функция для отправки сообщений в Telegram
+from bot.main import send_message  # ✅ используется существующая функция для отправки сообщений в Telegram
 
 
 # ============================================================
