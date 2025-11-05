@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
 from telegram import Update
@@ -12,19 +13,21 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# from utils.docx_reader import read_program
+from utils.docx_reader import read_program
 from utils.validator import generate_program_variants
-# from utils.docx_writer import save_program_to_docx  # включим, когда будет готов
+from utils.docx_writer import save_program_to_docx
+
 
 # ============================================================
-# 🔧 НАСТРОЙКА ЛОГИРОВАНИЯ
+# 🔧 ЛОГИРОВАНИЕ
 # ============================================================
 
 os.makedirs("logs", exist_ok=True)
 logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="INFO")
 
+
 # ============================================================
-# 🔹 ИНИЦИАЛИЗАЦИЯ БОТА
+# 🔐 ТОКЕН
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
@@ -34,7 +37,77 @@ if not TOKEN:
     logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN).")
     sys.exit(1)
 else:
-    logger.info(f"🔑 Токен найден. Длина: {len(TOKEN)} символов.")
+    logger.info(f"🔑 Токен найден, длина: {len(TOKEN)}")
+
+
+# ============================================================
+# 🧹 ОЧИСТКА СТАРЫХ ФАЙЛОВ
+# ============================================================
+
+def cleanup_old_files(directory: str, days: int = 1):
+    """Удаляет файлы старше указанного количества дней."""
+    folder = Path(directory)
+    if not folder.exists():
+        return
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    deleted = 0
+    for file in folder.glob("*"):
+        try:
+            if file.is_file() and datetime.fromtimestamp(file.stat().st_mtime) < cutoff:
+                file.unlink()
+                deleted += 1
+        except Exception as e:
+            logger.warning(f"Не удалось удалить {file}: {e}")
+    if deleted > 0:
+        logger.info(f"🧹 Очищено {deleted} старых файлов в {directory}")
+
+
+# ============================================================
+# 🔹 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def _tags_to_symbols(tags: list[str]) -> str:
+    """Преобразует внутренние теги в символы для вывода"""
+    if not tags:
+        return ""
+    result = []
+    if "gk" in tags:
+        result.append("(гк)")
+    if "early" in tags:
+        result.append("!")
+    if "later" in tags:
+        result.append("%")
+    return "".join(result)
+
+
+def _format_entry_line(idx: int, entry: dict) -> str:
+    """Формирует строку для вывода пользователю."""
+    num = entry.get("num", "") or ""
+    title = entry.get("title", "") or ""
+    etype = (entry.get("type") or "").lower()
+    kv = " 🏠КВ" if entry.get("kv") else ""
+    tmark = "🧷" if etype == "тянучка" else "🎭"
+
+    # актёры
+    actors_chunks = []
+    for a in entry.get("actors", []):
+        name = a.get("name", "").strip()
+        tag_sym = _tags_to_symbols(a.get("tags", []))
+        actors_chunks.append(f"{name}{tag_sym}" if tag_sym else name)
+    actors_str = ", ".join(actors_chunks) if actors_chunks else "—"
+
+    # тип
+    type_hint = ""
+    if etype == "предкулисье":
+        type_hint = " (предкулисье)"
+    elif etype == "спонсоры":
+        type_hint = " (спонсоры)"
+    elif etype == "тянучка":
+        type_hint = " (тянучка)"
+
+    num_part = f"№{num}" if num else "—"
+    return f"{idx:>2}. {tmark} {num_part} | {title}{type_hint}{kv}\n     👥 {actors_str}"
 
 
 # ============================================================
@@ -45,93 +118,102 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
-        "👋 Привет! Отправь мне .docx с программой концерта — я соберу её по правилам, "
-        "проверю конфликты актёров и при необходимости вставлю тянучки."
+        "👋 Привет! Отправь .docx с программой концерта — я проверю её, "
+        "переставлю при необходимости и добавлю тянучки.\n\n"
+        "⚙️ Важно: не трогаю предкулисье, 1-й, 2-й, предпоследний, спонсоры и последний номера."
     )
 
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает docx, парсит, валидирует и возвращает результат"""
+    """Получает .docx, парсит, валидирует и возвращает готовый файл."""
     user = update.effective_user
-    doc = update.message.document
+    document = update.message.document
 
-    if not doc or not doc.file_name.lower().endswith(".docx"):
+    if not document or not document.file_name.lower().endswith(".docx"):
         await update.message.reply_text("⚠️ Отправь файл в формате .docx, пожалуйста.")
         return
 
-    logger.info(f"📄 Получен файл от @{user.username}: {doc.file_name}")
-    file = await doc.get_file()
+    logger.info(f"📄 Получен .docx от @{user.username}: {document.file_name}")
+    file = await document.get_file()
 
     os.makedirs("data", exist_ok=True)
-    local_path = Path(f"data/{Path(doc.file_name).stem}_{user.id}.docx")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    local_path = Path(f"data/{timestamp}__{document.file_name}")
     await file.download_to_drive(local_path)
     logger.info(f"📥 Файл сохранён: {local_path}")
 
     try:
-        # 1️⃣ Парсинг DOCX
+        # 1️⃣ Очистка старых файлов
+        cleanup_old_files("data", days=1)
+        cleanup_old_files("logs", days=3)
+
+        # 2️⃣ Парсинг
         data = read_program(local_path)
-        logger.info(f"✅ Успешно прочитано {len(data)} строк программы.")
+        logger.info(f"✅ Успешно извлечено {len(data)} строк из документа.")
         logger.debug(json.dumps(data, indent=2, ensure_ascii=False))
 
-        # 2️⃣ Валидация и сборка программы
-        logger.info("⚙️ Начинаем валидацию и поиск допустимых перестановок...")
+        # 3️⃣ Валидация и перестановка
         variants, tcount = generate_program_variants(data)
-
         if not variants:
-            logger.error("🚫 Не удалось собрать ни одного корректного варианта.")
             await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
             return
 
-        # 3️⃣ Выбор первого подходящего варианта
         result = variants[0]
-        total_numbers = len(result)
-        anchors = len([x for x in result if (x.get('type') or '').lower() in ['предкулисье', 'спонсоры']])
+        logger.success(f"🎬 Итоговый вариант собран. Тянучек добавлено: {tcount}")
 
-        if tcount == 0:
-            msg = (
-                f"🎉 Программа успешно собрана без тянучек!\n"
-                f"Всего номеров: {total_numbers} (включая {anchors} якорных)."
-            )
-        else:
-            msg = (
-                f"✅ Программа готова!\n"
-                f"Добавлено тянучек: {tcount}\n"
-                f"Всего номеров: {total_numbers} (включая {anchors} якорных)."
-            )
-
-        logger.success(f"🎬 Итоговый вариант сформирован: {total_numbers} строк, {tcount} тянучек.")
-
-        # 4️⃣ Сохранение в DOCX (когда будет готов docx_writer)
-        # result_path = save_program_to_docx(result, f"data/output_{user.id}.docx")
-        # await update.message.reply_document(open(result_path, "rb"), caption=msg)
-
-        # Пока отправляем JSON и текст
-        await update.message.reply_text(msg)
-        short_preview = "\n".join(f"{i+1}. {r['title']}" for i, r in enumerate(result[:10]))
-        await update.message.reply_text(
-            f"🧾 Первые 10 строк программы:\n{short_preview}"
-            + ("\n…" if len(result) > 10 else "")
+        # 4️⃣ Формируем текст для Telegram
+        lines = [_format_entry_line(i, e) for i, e in enumerate(result, start=1)]
+        header = (
+            "✅ Программа собрана!\n"
+            f"Добавлено тянучек: {tcount}\n"
+            f"Всего позиций (включая тянучки): {len(result)}\n"
+            "— — — — — — — — — — — — — —\n"
         )
 
-        logger.debug("📦 Итоговая программа:\n" + json.dumps(result, indent=2, ensure_ascii=False))
+        text = header + "\n".join(lines)
+        MAX_LEN = 3900
+        if len(text) <= MAX_LEN:
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text(header)
+            chunk, size = [], 0
+            for line in lines:
+                if size + len(line) > MAX_LEN:
+                    await update.message.reply_text("\n".join(chunk))
+                    chunk, size = [], 0
+                chunk.append(line)
+                size += len(line)
+            if chunk:
+                await update.message.reply_text("\n".join(chunk))
+
+        # 5️⃣ Сохраняем результат в новый DOCX
+        out_path = Path(f"data/output_{timestamp}_{user.id}.docx")
+        save_program_to_docx(result, out_path)
+        logger.info(f"📁 Итоговый DOCX сохранён: {out_path}")
+
+        # 6️⃣ Отправляем пользователю
+        await update.message.reply_document(
+            open(out_path, "rb"),
+            caption=f"📄 Итоговый файл.\nТянучек добавлено: {tcount}."
+        )
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке docx: {e}")
-        await update.message.reply_text(f"❌ Ошибка при обработке файла:\n{e}")
+        await update.message.reply_text(f"❌ Ошибка при обработке файла: {e}")
 
 
 # ============================================================
-# 🔹 ОСНОВНОЙ ЗАПУСК
+# 🔹 ЗАПУСК
 # ============================================================
 
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
+    # Очистка при старте
+    cleanup_old_files("data", days=1)
+    cleanup_old_files("logs", days=3)
+
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))

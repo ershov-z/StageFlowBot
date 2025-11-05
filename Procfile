@@ -1,1 +1,1 @@
-web: python -m bot.main & python server.py
+web: python -m bot.main
