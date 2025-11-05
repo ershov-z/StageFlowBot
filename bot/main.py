@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -95,11 +96,6 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(local_path)
     logger.info(f"📥 Файл сохранён: {local_path}")
 
-    # ✅ Отправляем уведомление пользователю о начале обработки
-    await update.message.reply_text(
-        "Я начал обработку вашего файла! Обычно это занимает пару минут, ожидайте!"
-    )
-
     try:
         # 1️⃣ ПАРСИНГ
         data = read_program(local_path)
@@ -112,6 +108,24 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             open(parsed_json_path, "rb"),
             caption="📘 Исходные данные после парсинга:",
         )
+
+        # 🧮 Расчёт количества номеров для перестановки
+        movable = [
+            i for i, x in enumerate(data)
+            if x.get("type") == "обычный" and 2 < i < len(data) - 2
+        ]
+        count = len(movable)
+
+        factorial_val = math.factorial(count) if count <= 15 else f"≈ {math.factorial(15):.2e}+"  # защита от больших чисел
+
+        msg = (
+            f"📦 Файл получен!\n"
+            f"Количество номеров для перетасовки — {count}.\n"
+            f"Мне придётся пересчитать {factorial_val} вариантов, это может занять время.\n\n"
+            f"💪 Пожелайте мне удачи и проявите терпение!"
+        )
+
+        await update.message.reply_text(msg)
 
         # 2️⃣ ВАЛИДАЦИЯ И ПЕРЕСТАНОВКИ
         variants, stats = generate_program_variants(data)
