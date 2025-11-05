@@ -29,13 +29,13 @@ def _style_regular_cell(cell):
             run.font.size = Pt(10)
 
 
-def save_program_to_docx(program_data, output_path):
+def save_program_to_docx(program_data, output_path, template_path=None):
     """
     Сохраняет программу в .docx виде.
     program_data — список номеров (dict)
     """
     try:
-        doc = Document()
+        doc = Document(template_path) if template_path else Document()
 
         # Заголовок
         doc.add_heading("Программа концерта", level=1)
