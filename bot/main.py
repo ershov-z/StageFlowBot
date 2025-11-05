@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import math
+import time
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -66,6 +67,24 @@ else:
 
 
 # ============================================================
+# 🕒 ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ФОРМАТИРОВАНИЯ ВРЕМЕНИ
+# ============================================================
+
+def format_duration(seconds: float) -> str:
+    """Преобразует секунды в человекочитаемый формат"""
+    minutes = int(seconds // 60)
+    sec = int(seconds % 60)
+    if minutes == 0:
+        return f"{sec} сек"
+    elif minutes < 60:
+        return f"{minutes} мин {sec} сек"
+    else:
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours} ч {minutes} мин {sec} сек"
+
+
+# ============================================================
 # 🔹 ОБРАБОТЧИКИ
 # ============================================================
 
@@ -116,19 +135,31 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         count = len(movable)
 
-        factorial_val = math.factorial(count) if count <= 15 else f"≈ {math.factorial(15):.2e}+"  # защита от больших чисел
+        factorial_display = (
+            str(math.factorial(count))
+            if count <= 10
+            else f"≈ {math.factorial(10):.2e}+ (ограничено)"
+        )
 
         msg = (
             f"📦 Файл получен!\n"
             f"Количество номеров для перетасовки — {count}.\n"
-            f"Мне придётся пересчитать {factorial_val} вариантов, это может занять время.\n\n"
+            f"Мне придётся пересчитать {factorial_display} вариантов, это может занять время.\n\n"
             f"💪 Пожелайте мне удачи и проявите терпение!"
         )
 
         await update.message.reply_text(msg)
+        logger.info(f"🔢 Для перестановки найдено {count} номеров. Начинаю подбор вариантов...")
+
+        # Засекаем время начала
+        start_time = time.time()
 
         # 2️⃣ ВАЛИДАЦИЯ И ПЕРЕСТАНОВКИ
         variants, stats = generate_program_variants(data)
+
+        elapsed = time.time() - start_time
+        readable_time = format_duration(elapsed)
+        logger.info(f"⏱️ Подбор вариантов завершён за {readable_time} ({elapsed:.2f} сек).")
 
         initial_conflicts = stats.get("initial_conflicts", 0)
         final_conflicts = stats.get("final_conflicts", 0)
@@ -149,6 +180,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
         msg = (
             f"🎬 Программа успешно собрана!\n"
+            f"🕓 Время обработки: {readable_time}\n"
             f"Проверено перестановок: {total_checked}\n"
             f"Исходных конфликтов: {initial_conflicts}\n"
             f"Осталось конфликтов: {final_conflicts}\n"
