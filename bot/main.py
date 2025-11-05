@@ -2,8 +2,10 @@ import os
 import sys
 import json
 from datetime import datetime, timedelta
+from threading import Thread
 from pathlib import Path
 from loguru import logger
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -64,11 +66,30 @@ def cleanup_old_files(directory: str, days: int = 1):
 
 
 # ============================================================
+# 💓 HEALTH CHECK SERVER (для Koyeb)
+# ============================================================
+
+def start_health_server():
+    """Лёгкий Flask-сервер, чтобы Koyeb проходил health check"""
+    app = Flask(__name__)
+
+    @app.route("/")
+    def health():
+        return "OK", 200
+
+    def run():
+        port = int(os.getenv("PORT", 8000))
+        logger.info(f"💓 Health-check сервер запущен на порту {port}")
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+    Thread(target=run, daemon=True).start()
+
+
+# ============================================================
 # 🔹 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def _tags_to_symbols(tags: list[str]) -> str:
-    """Преобразует внутренние теги в символы для вывода"""
     if not tags:
         return ""
     result = []
@@ -82,7 +103,6 @@ def _tags_to_symbols(tags: list[str]) -> str:
 
 
 def _format_entry_line(idx: int, entry: dict) -> str:
-    """Формирует строку для вывода пользователю."""
     num = entry.get("num", "") or ""
     title = entry.get("title", "") or ""
     etype = (entry.get("type") or "").lower()
@@ -125,7 +145,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает .docx, парсит, валидирует и возвращает готовый файл."""
     user = update.effective_user
     document = update.message.document
 
@@ -143,16 +162,13 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📥 Файл сохранён: {local_path}")
 
     try:
-        # 1️⃣ Очистка старых файлов
         cleanup_old_files("data", days=1)
         cleanup_old_files("logs", days=3)
 
-        # 2️⃣ Парсинг
         data = read_program(local_path)
-        logger.info(f"✅ Успешно извлечено {len(data)} строк из документа.")
+        logger.info(f"✅ Прочитано {len(data)} строк.")
         logger.debug(json.dumps(data, indent=2, ensure_ascii=False))
 
-        # 3️⃣ Валидация и перестановка
         variants, tcount = generate_program_variants(data)
         if not variants:
             await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
@@ -161,12 +177,11 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = variants[0]
         logger.success(f"🎬 Итоговый вариант собран. Тянучек добавлено: {tcount}")
 
-        # 4️⃣ Формируем текст для Telegram
         lines = [_format_entry_line(i, e) for i, e in enumerate(result, start=1)]
         header = (
             "✅ Программа собрана!\n"
             f"Добавлено тянучек: {tcount}\n"
-            f"Всего позиций (включая тянучки): {len(result)}\n"
+            f"Всего номеров: {len(result)}\n"
             "— — — — — — — — — — — — — —\n"
         )
 
@@ -186,12 +201,10 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chunk:
                 await update.message.reply_text("\n".join(chunk))
 
-        # 5️⃣ Сохраняем результат в новый DOCX
         out_path = Path(f"data/output_{timestamp}_{user.id}.docx")
         save_program_to_docx(result, out_path)
         logger.info(f"📁 Итоговый DOCX сохранён: {out_path}")
 
-        # 6️⃣ Отправляем пользователю
         await update.message.reply_document(
             open(out_path, "rb"),
             caption=f"📄 Итоговый файл.\nТянучек добавлено: {tcount}."
@@ -208,13 +221,12 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
+    start_health_server()  # 💓 нужно для Koyeb
 
-    # Очистка при старте
     cleanup_old_files("data", days=1)
     cleanup_old_files("logs", days=3)
 
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
 
