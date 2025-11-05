@@ -19,7 +19,6 @@ from utils.docx_reader import read_program
 from utils.validator import generate_program_variants
 from utils.docx_writer import save_program_to_docx
 
-
 # ============================================================
 # 🔧 ЛОГИРОВАНИЕ
 # ============================================================
@@ -90,6 +89,7 @@ def start_health_server():
 # ============================================================
 
 def _tags_to_symbols(tags: list[str]) -> str:
+    """Преобразует список тегов в строку символов."""
     if not tags:
         return ""
     result = []
@@ -103,6 +103,7 @@ def _tags_to_symbols(tags: list[str]) -> str:
 
 
 def _format_entry_line(idx: int, entry: dict) -> str:
+    """Форматирует строку программы для вывода в Telegram."""
     num = entry.get("num", "") or ""
     title = entry.get("title", "") or ""
     etype = (entry.get("type") or "").lower()
@@ -138,9 +139,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
-        "👋 Привет! Отправь .docx с программой концерта — я проверю её, "
+        "👋 Привет! Отправь .docx с программой концерта — я проверю, "
         "переставлю при необходимости и добавлю тянучки.\n\n"
-        "⚙️ Важно: не трогаю предкулисье, 1-й, 2-й, предпоследний, спонсоры и последний номера."
+        "⚙️ Не трогаю: предкулисье, 1-й, 2-й, предпоследний, спонсоры и последний номера."
     )
 
 
@@ -165,10 +166,12 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cleanup_old_files("data", days=1)
         cleanup_old_files("logs", days=3)
 
+        # 1️⃣ Парсинг .docx
         data = read_program(local_path)
         logger.info(f"✅ Прочитано {len(data)} строк.")
         logger.debug(json.dumps(data, indent=2, ensure_ascii=False))
 
+        # 2️⃣ Генерация вариантов
         variants, tcount = generate_program_variants(data)
         if not variants:
             await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
@@ -177,6 +180,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = variants[0]
         logger.success(f"🎬 Итоговый вариант собран. Тянучек добавлено: {tcount}")
 
+        # 3️⃣ Форматированный вывод в Telegram
         lines = [_format_entry_line(i, e) for i, e in enumerate(result, start=1)]
         header = (
             "✅ Программа собрана!\n"
@@ -201,10 +205,12 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chunk:
                 await update.message.reply_text("\n".join(chunk))
 
+        # 4️⃣ Сохранение в docx
         out_path = Path(f"data/output_{timestamp}_{user.id}.docx")
-        save_program_to_docx(result, out_path)
+        save_program_to_docx(result, out_path, template_path=local_path)
         logger.info(f"📁 Итоговый DOCX сохранён: {out_path}")
 
+        # 5️⃣ Отправка пользователю
         await update.message.reply_document(
             open(out_path, "rb"),
             caption=f"📄 Итоговый файл.\nТянучек добавлено: {tcount}."
@@ -221,7 +227,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
-    start_health_server()  # 💓 нужно для Koyeb
+    start_health_server()  # 💓 для Koyeb
 
     cleanup_old_files("data", days=1)
     cleanup_old_files("logs", days=3)
