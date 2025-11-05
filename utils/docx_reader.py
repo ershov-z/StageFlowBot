@@ -2,30 +2,32 @@ from docx import Document
 from loguru import logger
 import re
 
-# ——— 1) извлекаем текст с реальными переводами строк из ячейки docx-таблицы ———
 def _extract_text_with_breaks(cell):
-    ns = cell._element.nsmap
-    lines = []
-    # каждый абзац как строка
-    for p in cell._element.xpath(".//w:p", namespaces=ns):
-        buf = []
-        for r in p.xpath(".//w:r", namespaces=ns):
-            # текстовые куски
-            for t in r.xpath(".//w:t", namespaces=ns):
-                if t.text:
-                    buf.append(t.text)
-            # «мягкие» переносы <w:br/> превращаем в \n
-            if r.xpath(".//w:br", namespaces=ns):
-                buf.append("\n")
-        line = "".join(buf).strip()
-        lines.append(line)
-    # абзац — это тоже перенос
-    text = "\n".join([ln for ln in lines if ln])
-    # нормализуем редкие разделители из Word (на всякий случай)
-    text = text.replace("\r", "\n")
-    return text.strip()
+    """Извлекает текст из ячейки Word с сохранением переводов строк"""
+    try:
+        # Извлекаем все абзацы <w:p> и <w:br> внутри ячейки
+        lines = []
+        for p in cell._element.xpath(".//w:p"):
+            buf = []
+            for r in p.xpath(".//w:r"):
+                for t in r.xpath(".//w:t"):
+                    if t.text:
+                        buf.append(t.text)
+                # перенос строки <w:br>
+                if r.xpath(".//w:br"):
+                    buf.append("\n")
+            line = "".join(buf).strip()
+            if line:
+                lines.append(line)
+        text = "\n".join(lines)
+        text = text.replace("\r", "\n").strip()
+        return text
+    except Exception as e:
+        logger.warning(f"⚠ Ошибка извлечения текста из ячейки: {e}")
+        return cell.text.strip() if cell.text else ""
 
-# ——— 2) надёжный сплиттер — видит все типы «строковых» разделителей ———
+
+# Универсальный сплиттер
 _SPLIT_RE = re.compile(r"[\n\r\u000b\u2028\u2029;,/\\]+")
 
 def _split_people_blob(blob: str) -> list[str]:
@@ -34,17 +36,17 @@ def _split_people_blob(blob: str) -> list[str]:
     parts = [p.strip() for p in _SPLIT_RE.split(blob) if p.strip()]
     return parts
 
+
 def parse_actors(raw: str) -> list[dict]:
     """
-    теги:
-      %  -> 'later'
-      !  -> 'early'
-      (гк) -> 'gk' (приоритет)
-    может быть несколько тегов, порядок не важен.
+    Парсинг списка актёров с тегами:
+      %  → later
+      !  → early
+      (гк) → gk (приоритет)
     """
     if not raw:
         return []
-    result: list[dict] = []
+    result = []
     for token in _split_people_blob(raw):
         name = token.strip()
         tags = set()
@@ -52,7 +54,7 @@ def parse_actors(raw: str) -> list[dict]:
         lname = name.lower()
         if "(гк)" in lname or "(г к)" in lname:
             tags.add("gk")
-            name = (name.replace("(гк)", "").replace("(ГК)", "").replace("(г к)", "")).strip()
+            name = name.replace("(гк)", "").replace("(ГК)", "").replace("(г к)", "").strip()
 
         if "%" in name:
             tags.add("later")
@@ -66,7 +68,9 @@ def parse_actors(raw: str) -> list[dict]:
             result.append({"name": name, "tags": list(tags)})
     return result
 
+
 def read_program(path: str):
+    """Читает первую таблицу из DOCX и возвращает структурированные данные"""
     logger.info(f"📄 Чтение документа: {path}")
     doc = Document(path)
     if not doc.tables:
@@ -76,7 +80,7 @@ def read_program(path: str):
     table = doc.tables[0]
     rows = table.rows
     if len(rows) < 2:
-        logger.error("❌ Таблица пустая или без данных.")
+        logger.error("❌ Таблица пуста.")
         return []
 
     data = []
@@ -98,7 +102,7 @@ def read_program(path: str):
             "order": i,
             "num": num,
             "title": title,
-            "actors_raw": actors_raw,   # исходник с тегами — сохраняем как есть
+            "actors_raw": actors_raw,
             "pp": pp,
             "hire": hire,
             "responsible": responsible,
@@ -106,25 +110,23 @@ def read_program(path: str):
             "type": "обычный",
         }
 
-        t = title.lower()
-        if "предкулисье" in t:
+        lower_title = title.lower()
+        if "предкулисье" in lower_title:
             entry["type"] = "предкулисье"
-        elif "спонсор" in t:
+        elif "спонсор" in lower_title:
             entry["type"] = "спонсоры"
-        elif "тянуч" in t:
+        elif "тянуч" in lower_title:
             entry["type"] = "тянучка"
 
-        # КЛЮЧЕВОЕ: строим структурный список актёров из actors_raw
         entry["actors"] = parse_actors(actors_raw)
-
         data.append(entry)
 
     logger.info(f"✅ Прочитано {len(data)} строк.")
     return data
 
-# ===== УДАЛИТЬ: локальный тест =====
+
+# --- УДАЛИТЬ после теста ---
 if __name__ == "__main__":
     import json
-    sample = "Ксюша\nИсаев\x0bБрекоткин\u2028Ярица\u2029Соколов,Илана;Попов/(гк)!%%"
-    print(_split_people_blob(sample))
-    print(parse_actors(sample))
+    test_str = "Ксюша!(гк)\nИсаев%\nБрекоткин%%!\nЯрица\nСоколов"
+    print(json.dumps(parse_actors(test_str), ensure_ascii=False, indent=2))
