@@ -11,7 +11,7 @@ from utils.docx_reader import read_program
 logger.info(f"✅ Импортирован read_program из: {getattr(read_program, '__code__', None) and read_program.__code__.co_filename}")
 
 # === Конфигурация ===
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 DATA_DIR = os.path.join(os.getcwd(), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 LOG_DIR = os.path.join(os.getcwd(), "logs")
