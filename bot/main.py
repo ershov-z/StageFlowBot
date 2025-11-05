@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from utils.docx_reader import read_program
+# from utils.docx_reader import read_program
 from utils.validator import generate_program_variants
 # from utils.docx_writer import save_program_to_docx  # включим, когда будет готов
 
