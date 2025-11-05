@@ -1,183 +1,172 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
-
-
-# ====== Результат проверки ======
-@dataclass
-class CheckResult:
-    ok: bool
-    reasons: List[str]
-
-    def __bool__(self) -> bool:
-        return self.ok
+import itertools
+import json
+import time
+from copy import deepcopy
+from loguru import logger
+from datetime import datetime
+from pathlib import Path
 
 
-# ====== Вспомогательные функции ======
-def _split_people_blob(blob: str) -> List[str]:
+# ============================================================
+# 🔹 Константы
+# ============================================================
+
+TENUCHKA_ACTORS = ["Пушкин", "Исаев", "Рожков"]
+
+
+# ============================================================
+# 🔹 Проверка конфликта между номерами
+# ============================================================
+
+def _has_conflict(item_a, item_b):
+    """Возвращает True, если между item_a и item_b конфликт"""
+    if not item_a or not item_b:
+        return False
+
+    actors_a = {a["name"] for a in item_a.get("actors", [])}
+    actors_b = {a["name"] for a in item_b.get("actors", [])}
+
+    # Если есть пересечение актёров
+    if actors_a & actors_b:
+        # Проверяем наличие "гк" у любого из них
+        has_gk_a = any("gk" in a["tags"] for a in item_a["actors"])
+        has_gk_b = any("gk" in a["tags"] for a in item_b["actors"])
+        if has_gk_a or has_gk_b:
+            return True
+        # Проверяем близкие теги
+        tags_a = set(t for a in item_a["actors"] for t in a["tags"])
+        tags_b = set(t for a in item_b["actors"] for t in a["tags"])
+        if ("later" in tags_a and "later" in tags_b) or ("early" in tags_a and "early" in tags_b):
+            return True
+        return True
+
+    return False
+
+
+# ============================================================
+# 🔹 Подсчёт конфликтов в последовательности
+# ============================================================
+
+def _count_conflicts(program):
+    """Подсчёт количества конфликтов между соседними номерами"""
+    count = 0
+    for i in range(len(program) - 1):
+        if _has_conflict(program[i], program[i + 1]):
+            count += 1
+    return count
+
+
+# ============================================================
+# 🔹 Вставка тянучек для устранения конфликтов
+# ============================================================
+
+def _insert_tenuchki(program):
+    """Добавляет тянучки между конфликтными номерами"""
+    fixed_program = []
+    tenuchki_count = 0
+
+    for i in range(len(program)):
+        fixed_program.append(program[i])
+        if i < len(program) - 1 and _has_conflict(program[i], program[i + 1]):
+            for actor in TENUCHKA_ACTORS:
+                prev_has_gk = any(a["name"] == actor and "gk" in a["tags"] for a in program[i]["actors"])
+                next_has_gk = any(a["name"] == actor and "gk" in a["tags"] for a in program[i + 1]["actors"])
+                if not (prev_has_gk or next_has_gk):
+                    tenuchka = {
+                        "order": f"T-{i+1}",
+                        "num": "",
+                        "title": f"Тянучка ({actor})",
+                        "actors_raw": actor,
+                        "pp": actor,
+                        "hire": "",
+                        "responsible": actor,
+                        "kv": False,
+                        "type": "тянучка",
+                        "actors": [{"name": actor, "tags": []}]
+                    }
+                    fixed_program.append(tenuchka)
+                    logger.info(f"➕ Вставлена тянучка ({actor}) между «{program[i]['title']}» и «{program[i+1]['title']}».")
+                    tenuchki_count += 1
+                    break
+
+    return fixed_program, tenuchki_count
+
+
+# ============================================================
+# 🔹 Основная функция генерации вариантов
+# ============================================================
+
+def generate_program_variants(program):
     """
-    Разбивает строку актёров на отдельные имена.
-    Поддерживает разделители: перевод строки, запятая, точка с запятой, /, \\
+    Генерирует все возможные перестановки, считает конфликты,
+    выбирает лучшие 5 и добавляет тянучки в лучший вариант.
     """
-    if not blob:
-        return []
-    raw = (
-        blob.replace("\r", "\n")
-        .replace(";", "\n")
-        .replace("/", "\n")
-        .replace("\\", "\n")
-    )
-    parts = []
-    for line in raw.split("\n"):
-        for piece in line.split(","):
-            piece = piece.strip()
-            if piece:
-                parts.append(piece)
-    return parts
+    logger.info("🧩 Запуск валидации программы...")
 
+    start_time = time.time()
 
-def _parse_actor_token(token: str) -> Tuple[str, Set[str]]:
-    """
-    Разбирает теги внутри имени: %, !, (гк)
-    Возвращает (чистое имя, набор тегов: {'later','early','gk'})
-    """
-    name = token.strip()
-    tags: Set[str] = set()
+    # === Выделяем фиксированные и подвижные элементы ===
+    fixed_indices = []
+    movable_items = []
 
-    # 💄 ищем все вхождения тегов, даже множественные
-    # (гк) имеет приоритет — если он есть, то он главный
-    if "(гк)" in name.lower() or "(г к)" in name.lower():
-        tags.add("gk")
-        name = name.replace("(гк)", "").replace("(ГК)", "").replace("(г к)", "").strip()
+    for i, item in enumerate(program):
+        title = item["title"].lower()
+        if "предку" in title or "спонсор" in title:
+            fixed_indices.append(i)
+        elif i in (1, 2, len(program) - 2, len(program) - 1):
+            fixed_indices.append(i)
+        else:
+            movable_items.append(item)
 
-    # далее разбираем % и !
-    if "%" in name:
-        tags.add("later")
-        name = name.replace("%", "").strip()
+    # === Генерация всех перестановок ===
+    permutations = list(itertools.permutations(movable_items))
+    checked_variants = len(permutations)
+    logger.info(f"📊 Проверяется {checked_variants} перестановок...")
 
-    if "!" in name:
-        tags.add("early")
-        name = name.replace("!", "").strip()
+    results = []
+    for perm in permutations:
+        variant = deepcopy(program)
+        movable_iter = iter(perm)
+        for i in range(len(variant)):
+            if i not in fixed_indices:
+                variant[i] = next(movable_iter)
 
-    # если встречались несколько %, это не ошибка — просто повторное подтверждение
-    # финально чистим лишние пробелы
-    name = " ".join(name.split())
+        conflicts = _count_conflicts(variant)
+        results.append({"conflicts": conflicts, "variant": variant})
 
-    return name, tags
+    # === Сортировка и топ-5 ===
+    results.sort(key=lambda x: x["conflicts"])
+    best_variants = results[:5]
 
+    logger.info(f"✅ Всего вариантов: {checked_variants}")
+    logger.info(f"🏆 Лучшие варианты:")
 
-def normalize_actors(entry: Dict) -> Dict[str, Set[str]]:
-    """
-    Приводит информацию о актёрах к виду {имя: теги}.
-    Приоритетно разбирает entry["actors_raw"], иначе использует entry["actors"].
-    """
-    found: Dict[str, Set[str]] = {}
+    for i, var in enumerate(best_variants, 1):
+        titles = [v["title"] for v in var["variant"]]
+        logger.info(f"  #{i}: {var['conflicts']} конфликтов → {titles}")
 
-    raw = (entry.get("actors_raw") or "").strip()
-    tokens = _split_people_blob(raw)
-
-    if not tokens:
-        for a in entry.get("actors", []):
-            name = a.get("name", "")
-            tokens.extend(_split_people_blob(name))
-
-    for tok in tokens:
-        name, tags = _parse_actor_token(tok)
-        if not name:
-            continue
-        if name not in found:
-            found[name] = set()
-        found[name].update(tags)
-
-    return found
-
-
-# ====== Проверки ======
-def _kv_ok(prev: Dict, curr: Dict) -> Tuple[bool, str | None]:
-    """Запрещает ставить два номера с КВ подряд."""
-    if prev.get("kv") and curr.get("kv"):
-        return False, "Два номера с КВ подряд запрещены"
-    return True, None
-
-
-def _actors_ok(prev: Dict, curr: Dict, *, tyanuchka_between: bool) -> Tuple[bool, List[str]]:
-    """
-    Проверка пересечения актёров между соседними номерами.
-    Правила:
-      - актёр не должен выступать подряд;
-      - если в ПРЕДЫДУЩЕМ номере у актёра 'early' → можно подряд;
-      - если в ТЕКУЩЕМ номере у актёра 'later' → можно подряд;
-      - если где-либо 'gk' → нужен минимум один номер паузы;
-      - если есть тянучка → снимает все ограничения, кроме (гк).
-    """
-    reasons: List[str] = []
-
-    prev_actors = normalize_actors(prev)
-    curr_actors = normalize_actors(curr)
-
-    common = set(prev_actors.keys()) & set(curr_actors.keys())
-    if not common:
-        return True, reasons
-
-    for name in sorted(common):
-        prev_tags = prev_actors.get(name, set())
-        curr_tags = curr_actors.get(name, set())
-
-        # (гк) приоритетно
-        if "gk" in prev_tags or "gk" in curr_tags:
-            reasons.append(f"'{name}': (гк) требует паузы минимум в один номер")
-            continue
-
-        # если есть тянучка — снимаем остальные запреты
-        if tyanuchka_between:
-            continue
-
-        # проверка обычного подряд
-        allow_by_early = "early" in prev_tags
-        allow_by_later = "later" in curr_tags
-
-        if not (allow_by_early or allow_by_later):
-            reasons.append(f"'{name}': выступает подряд без разрешающих тегов (!, %)")
-
-    return len(reasons) == 0, reasons
-
-
-def can_follow(prev: Dict, curr: Dict, *, tyanuchka_between: bool = False) -> CheckResult:
-    """
-    Проверяет, можно ли ставить номер curr сразу после prev.
-    Возвращает CheckResult(ok, reasons)
-    """
-    ok_kv, kv_reason = _kv_ok(prev, curr)
-    if not ok_kv:
-        return CheckResult(False, [kv_reason])
-
-    ok_act, act_reasons = _actors_ok(prev, curr, tyanuchka_between=tyanuchka_between)
-    if not ok_act:
-        return CheckResult(False, act_reasons)
-
-    return CheckResult(True, [])
-
-
-# ====== УДАЛИТЬ (самотест) ======
-if __name__ == "__main__":
-    # демонстрация разных кейсов
-    prev = {
-        "title": "Номер A",
-        "kv": False,
-        "actors_raw": "Брекоткин%%!\nСоколов!(гк)\nИсаев",
+    # === Сохраняем топ-5 в JSON ===
+    Path("logs").mkdir(exist_ok=True)
+    best_data = {
+        "checked_variants": checked_variants,
+        "best_variants": [
+            {
+                "conflicts": var["conflicts"],
+                "sequence": [v["title"] for v in var["variant"]],
+            }
+            for var in best_variants
+        ],
     }
-    curr = {
-        "title": "Номер B",
-        "kv": True,
-        "actors_raw": "Брекоткин%\nСоколов\nИсаев%",
-    }
+    out_path = Path(f"logs/best_variants_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(best_data, f, ensure_ascii=False, indent=2)
 
-    # без тянучки
-    r1 = can_follow(prev, curr)
-    print("A→B без тянучки:", r1.ok, r1.reasons)
+    # === Выбираем лучший вариант и добавляем тянучки ===
+    best_variant = best_variants[0]["variant"]
+    final_program, tenuchki_count = _insert_tenuchki(best_variant)
 
-    # с тянучкой
-    r2 = can_follow(prev, curr, tyanuchka_between=True)
-    print("A→B с тянучкой:", r2.ok, r2.reasons)
-# ====== УДАЛИТЬ ======
+    elapsed = time.time() - start_time
+    logger.success(f"🎯 Валидация завершена. Проверено {checked_variants} вариантов за {elapsed:.2f} сек.")
+    logger.success(f"Добавлено тянучек: {tenuchki_count}.")
+
+    return final_program, tenuchki_count, checked_variants
