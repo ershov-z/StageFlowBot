@@ -1,3 +1,5 @@
+# bot/main.py
+
 import os
 import sys
 import json
@@ -17,6 +19,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# 👇 Исправленные импорты
 from utils.docx_reader import read_program
 from utils.validator import generate_program_variants
 from utils.docx_writer import save_program_to_docx
@@ -59,8 +62,9 @@ def start_health_server():
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 TOKEN = TELEGRAM_TOKEN.strip()
+
 if not TOKEN:
-    logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN).")
+    logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN). Завершение работы.")
     sys.exit(1)
 else:
     logger.info(f"🔑 Токен найден, длина: {len(TOKEN)}")
@@ -93,9 +97,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
         "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую, "
-        "переставлю номера и при необходимости добавлю тянучки. Важно: актёры должны иметь теги %, !, (гк) "
-        "точно в таком формате. Не забывайте вставлять пробел после каждого актера, прежде чем нажать энтер! "
-        "Также придерживайтесь стандартного формата столбцов."
+        "переставлю номера и при необходимости добавлю тянучки. "
+        "Формат тегов: %, !, (гк). Не забывай ставить пробел между актёрами перед Enter!"
     )
 
 
@@ -129,38 +132,28 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="📘 Исходные данные после парсинга:",
         )
 
-        # 🧮 Расчёт количества номеров для перестановки
-        movable = [
-            i for i, x in enumerate(data)
-            if x.get("type") == "обычный" and 2 < i < len(data) - 2
-        ]
+        movable = [i for i, x in enumerate(data)
+                   if x.get("type") == "обычный" and 2 < i < len(data) - 2]
         count = len(movable)
-
         factorial_display = (
-            str(math.factorial(count))
-            if count <= 10
-            else f"≈ {math.factorial(10):.2e}+ (ограничено)"
+            str(math.factorial(count)) if count <= 10 else f"≈ {math.factorial(10):.2e}+ (ограничено)"
         )
 
-        # ✅ Сообщение перед валидацией
         msg = (
             f"📦 Файл получен!\n"
-            f"Количество номеров для перестасовки — {count}.\n"
-            f"Мне придётся пересчитать {factorial_display} вариантов, это может занять время.\n\n"
-            f"💪 Пожелайте мне удачи и проявите терпение!"
+            f"Количество номеров для перестановки — {count}.\n"
+            f"Придётся пересчитать {factorial_display} вариантов.\n"
+            f"💪 Процесс может занять несколько минут!"
         )
         await update.message.reply_text(msg)
-        logger.info(f"🔢 Для перестановки найдено {count} номеров. Начинаю подбор вариантов...")
+        logger.info(f"Начинаю подбор вариантов ({count} номеров)...")
 
-        # Засекаем время начала
         start_time = time.time()
-
-        # 2️⃣ ВАЛИДАЦИЯ И ПЕРЕСТАНОВКИ
         variants, stats = generate_program_variants(data)
-
         elapsed = time.time() - start_time
+
         readable_time = format_duration(elapsed)
-        logger.info(f"⏱️ Подбор вариантов завершён за {readable_time} ({elapsed:.2f} сек).")
+        logger.info(f"⏱️ Завершено за {readable_time}")
 
         initial_conflicts = stats.get("initial_conflicts", 0)
         final_conflicts = stats.get("final_conflicts", 0)
@@ -172,12 +165,10 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         result = variants[0]
-
         result_json_path = Path(f"data/result_{timestamp}_{user.id}.json")
         with open(result_json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
 
-        # Формирование отчёта
         tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
         msg = (
             f"🎬 Программа успешно собрана!\n"
@@ -186,33 +177,19 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Исходных конфликтов: {initial_conflicts}\n"
             f"Осталось конфликтов: {final_conflicts}\n"
             f"Добавлено тянучек: {tcount}\n"
-            f"Всего номеров: {len(result)}.\n\n"
         )
         if tcount > 0:
-            msg += "🧩 Добавлены тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+            msg += "\n🧩 Добавлены тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
         else:
-            msg += "✅ Программа собрана без тянучек!"
+            msg += "\n✅ Без тянучек!"
 
-        # 3️⃣ СОХРАНЕНИЕ ИТОГОВОГО DOCX
-        # ВАЖНО: передаём original_filename=document.file_name, чтобы получить "<оригинал>_ershobot.docx"
         out_path = Path(f"data/output_{timestamp}_{user.id}.docx")
-        save_program_to_docx(
-            result,
-            out_path,
-            original_filename=document.file_name  # ← ключевой параметр для имени "<имя>_ershobot.docx"
-        )
-        logger.success("🎯 Итоговый DOCX сохранён (с суффиксом _ershobot по оригинальному названию).")
-
-        # 4️⃣ ОТПРАВКА ПОЛЬЗОВАТЕЛЮ
-        await update.message.reply_text(
-            f"✅ Анализ завершён!\nОбщее время выполнения: {readable_time}"
-        )
-        await update.message.reply_document(open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
-        # Путь вернулся из save_program_to_docx — сохраняется в той же директории, имя соответствует "<оригинал>_ershobot.docx"
-        # Поэтому отправим последний сохранённый файл из папки data с нужным суффиксом
-        # (docx_writer уже сохраняет в out_dir; мы просто повторно укажем путь)
+        save_program_to_docx(result, out_path, original_filename=document.file_name)
         ersho_name = Path(document.file_name).stem + "_ershobot.docx"
         ersho_path = Path("data") / ersho_name
+
+        await update.message.reply_text(f"✅ Готово! Время: {readable_time}")
+        await update.message.reply_document(open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
         await update.message.reply_document(open(ersho_path, "rb"), caption=msg)
 
     except Exception as e:
@@ -237,4 +214,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # ✅ Гарантируем корректный импорт при запуске напрямую
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
     main()

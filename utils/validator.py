@@ -1,10 +1,12 @@
-# Импортируем библиотеки и начнем обработку нового валидатора с учетом всех требований
+# utils/validator.py
+# ============================================================
+# 🎯 Валидатор и подбор программы с оптимизацией
+# ============================================================
 
 import copy
 import random
 from loguru import logger
-from utils.telegram_utils import send_message # ✅ используется существующая функция для отправки сообщений в Telegram
-
+from utils.telegram_utils import send_message  # ✅ импорт из отдельного модуля
 
 # ============================================================
 # 🔧 Вспомогательные проверки
@@ -43,7 +45,6 @@ def _has_gk(item, name):
 def _has_later(item, name):
     return "later" in _actor_tags(item, name)
 
-
 # ============================================================
 # ⚔️ Конфликты и запрещённые соседства
 # ============================================================
@@ -75,7 +76,6 @@ def _adjacency_forbidden(left, right):
 def _count_conflicts(program):
     return sum(_adjacent_conflict(program[i], program[i + 1]) for i in range(len(program) - 1))
 
-
 # ============================================================
 # 🧱 Фиксированные позиции
 # ============================================================
@@ -88,9 +88,8 @@ def _compute_fixed_indices(program):
             fixed.add(i)
     return sorted(fixed), [i for i in range(n) if i not in fixed]
 
-
 # ============================================================
-# 🔍 Проверка KV-цепочек (через тянучки)
+# 🔍 Проверки KV и gk
 # ============================================================
 
 def _has_kv_violation(program):
@@ -105,10 +104,6 @@ def _has_kv_violation(program):
             last_kv = i
     return False
 
-
-# ============================================================
-# 🔍 Проверка gk-разрывов сквозь тянучки
-# ============================================================
 
 def _has_gk_violation(program):
     """True, если актёр с gk появляется снова, и между появлениями только тянучки."""
@@ -127,9 +122,8 @@ def _has_gk_violation(program):
             last_seen[name] = i
     return False
 
-
 # ============================================================
-# 🔁 Поиск с фильтрацией KV и gk
+# 🔁 Поиск оптимальных вариантов
 # ============================================================
 
 def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
@@ -155,7 +149,6 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
         if pos >= n:
             checked += 1
             if _has_kv_violation(current) or _has_gk_violation(current):
-                logger.debug("⛔ Отброшен вариант из-за KV или gk-разрыва")
                 return
             if confs <= best_conf:
                 best.append((confs, copy.deepcopy(current)))
@@ -189,30 +182,18 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
     backtrack(0, 0)
     return best[:max_results], checked
 
-
 # ============================================================
-# 🪶 Тянучки
+# 🪶 Добавление тянучек
 # ============================================================
 
 def _can_actor_host_tyan(program, idx, actor):
-    """
-    Новая логика ведущего:
-      - нельзя, если актёр есть в следующем номере (R), кроме случая если там тег 'later';
-      - нельзя, если в следующем номере у него 'gk';
-      - можно, если через один номер (R+1) он появляется — это разрешено;
-      - можно, если в R+1 у него 'gk' — это не влияет;
-      - можно, если он больше не встречается.
-    """
     n = len(program)
-    # Следующий номер
     if idx + 1 < n and _is_number(program[idx + 1]):
         nxt = program[idx + 1]
         if _has_gk(nxt, actor):
             return False
         if _has_actor(nxt, actor) and not _has_later(nxt, actor):
             return False
-
-    # Через один номер — разрешено в любом случае
     return True
 
 
@@ -234,10 +215,16 @@ def _insert_tyanuchki(program, max_tyanuchki=3):
             for actor in pri:
                 if actor in shared and _can_actor_host_tyan(program, i, actor):
                     t = {
-                        "order": None, "num": "", "title": f"Тянучка ({actor})",
-                        "actors_raw": actor, "pp": "", "hire": "",
-                        "responsible": actor, "kv": False,
-                        "type": "тянучка", "actors": [{"name": actor, "tags": []}]
+                        "order": None,
+                        "num": "",
+                        "title": f"Тянучка ({actor})",
+                        "actors_raw": actor,
+                        "pp": "",
+                        "hire": "",
+                        "responsible": actor,
+                        "kv": False,
+                        "type": "тянучка",
+                        "actors": [{"name": actor, "tags": []}],
                     }
                     program.insert(i + 1, t)
                     tcount += 1
@@ -246,30 +233,42 @@ def _insert_tyanuchki(program, max_tyanuchki=3):
         i += 1
     return program, tcount
 
-
 # ============================================================
 # 🎯 Основная функция
 # ============================================================
 
-def generate_program_variants(program, top_n=5):
+def generate_program_variants(program, chat_id=None, top_n=5):
+    """
+    Генерирует варианты программы с минимальными конфликтами и добавлением тянучек.
+    chat_id — ID пользователя для отправки уведомлений (если есть).
+    """
     logger.info("🧩 Генерация вариантов программы...")
 
-    # ✅ Отправляем уведомление пользователю перед началом перебора
-    try:
-        send_message("Начат подбор вариантов! Обычно этот процесс занимает пару минут, ожидайте.")
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
+    # ✅ Отправляем уведомление пользователю (если chat_id известен)
+    if chat_id:
+        try:
+            send_message(chat_id, "Начат подбор вариантов! Это может занять пару минут ⏳")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить сообщение в Telegram: {e}")
 
     if not program or len(program) < 2:
         base = _count_conflicts(program)
-        return [program], {"checked_variants": 0, "initial_conflicts": base,
-                           "final_conflicts": base, "tyanuchki_added": 0}
+        return [program], {
+            "checked_variants": 0,
+            "initial_conflicts": base,
+            "final_conflicts": base,
+            "tyanuchki_added": 0,
+        }
 
     best, checked = _search_best_variants(program)
     if not best:
         base = _count_conflicts(program)
-        return [program], {"checked_variants": checked, "initial_conflicts": base,
-                           "final_conflicts": base, "tyanuchki_added": 0}
+        return [program], {
+            "checked_variants": checked,
+            "initial_conflicts": base,
+            "final_conflicts": base,
+            "tyanuchki_added": 0,
+        }
 
     logger.info(f"✅ Проверено {checked} вариантов")
     best_conf, best_prog = best[0]
@@ -279,14 +278,28 @@ def generate_program_variants(program, top_n=5):
     # Финальная KV/gk проверка
     if _has_kv_violation(prog):
         logger.warning("⚠️ Финальный вариант содержит KV подряд — отброшен")
-        return [program], {"checked_variants": checked, "initial_conflicts": best_conf,
-                           "final_conflicts": None, "tyanuchki_added": added}
+        return [program], {
+            "checked_variants": checked,
+            "initial_conflicts": best_conf,
+            "final_conflicts": None,
+            "tyanuchki_added": added,
+        }
+
     if _has_gk_violation(prog):
-        logger.warning("⚠️ Финальный вариант содержит gk-разрыв только с тянучками — отброшен")
-        return [program], {"checked_variants": checked, "initial_conflicts": best_conf,
-                           "final_conflicts": None, "tyanuchki_added": added}
+        logger.warning("⚠️ Финальный вариант содержит gk-разрыв через тянучки — отброшен")
+        return [program], {
+            "checked_variants": checked,
+            "initial_conflicts": best_conf,
+            "final_conflicts": None,
+            "tyanuchki_added": added,
+        }
 
     final_conf = _count_conflicts(prog)
     logger.success(f"🎯 Конфликтов {best_conf} → {final_conf} после {added} тянучек")
-    return [prog], {"checked_variants": checked, "initial_conflicts": best_conf,
-                    "final_conflicts": final_conf, "tyanuchki_added": added}
+
+    return [prog], {
+        "checked_variants": checked,
+        "initial_conflicts": best_conf,
+        "final_conflicts": final_conf,
+        "tyanuchki_added": added,
+    }
