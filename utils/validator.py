@@ -1,41 +1,51 @@
-# validator.py
+# utils/validator.py
 # ============================================================
-# 🎯 Валидатор и подбор программы с оптимизацией + STOP
+# 🎯 Валидатор и подбор программы
+# — расширенное логирование, многослойная вставка тянучек, возврат лучшего при STOP
+# — совместим с multiprocessing.Event (из main)
 # ============================================================
 
+from __future__ import annotations
 import copy
 import random
 import time
 import threading
 from typing import List, Tuple, Dict, Any, Optional
 from loguru import logger
-
-# Если в проекте telegram_utils лежит рядом с этим файлом (как у тебя),
-# используем прямой импорт без пакета utils.*
 from utils.telegram_utils import send_message
 
 # ============================================================
-# 🛑 STOP-событие — читается из любой глубины рекурсии
+# 🛑 STOP (поддержка внешнего multiprocessing.Event)
 # ============================================================
 
 STOP_EVENT = threading.Event()
 
+def set_external_stop_event(event):
+    """Позволяет подменить стандартный STOP_EVENT внешним multiprocessing.Event."""
+    global STOP_EVENT
+    STOP_EVENT = event
+    logger.debug("🔗 STOP_EVENT: подключён внешний контроллер (multiprocessing.Event)")
+
 class StopComputation(Exception):
-    """Сигнал для мгновенной остановки расчёта"""
+    """Сигнал для мгновенной остановки расчёта."""
     pass
 
 def request_stop():
-    """Запросить остановку текущего расчёта"""
+    """Локально поднять STOP (если используется потоковая модель)."""
     STOP_EVENT.set()
     logger.warning("🛑 Получен запрос на остановку расчёта пользователем.")
 
 def reset_stop():
-    """Сбросить флаг остановки перед новым запуском"""
-    STOP_EVENT.clear()
+    """Сброс STOP для нового запуска (если нет внешнего контроллера)."""
+    try:
+        STOP_EVENT.clear()
+    except Exception:
+        # если STOP_EVENT — multiprocessing.Event, у него тоже есть clear()
+        pass
 
 
 # ============================================================
-# 🔧 Утилиты по типам элементов
+# 🧩 Нормализация и типы элементов
 # ============================================================
 
 def _norm(s: Optional[str]) -> str:
@@ -46,30 +56,32 @@ def _is_tyan(item: Dict[str, Any]) -> bool:
 
 def _is_sponsor(item: Dict[str, Any]) -> bool:
     t = _norm(item.get("type"))
-    ttl = _norm(item.get("title"))
-    return t == "спонсоры" or "спонсор" in ttl
+    title = _norm(item.get("title"))
+    return t == "спонсоры" or "спонсор" in title
 
 def _is_prekulisse(item: Dict[str, Any]) -> bool:
     t = _norm(item.get("type"))
-    ttl = _norm(item.get("title"))
-    return "предкулис" in (t or ttl)
+    title = _norm(item.get("title"))
+    return "предкулис" in (t or title)
 
 def _is_full_number(item: Dict[str, Any]) -> bool:
-    """Полноценный номер — учитывается как «номер» для gk/kv буфера"""
+    """Полноценный номер (участвует в перестановке)."""
     return _norm(item.get("type")) == "обычный"
 
 def _is_non_number(item: Dict[str, Any]) -> bool:
-    """Тянучки и спонсоры не считаются «номерами»"""
     return _is_tyan(item) or _is_sponsor(item) or _is_prekulisse(item)
 
 def _is_kv(item: Dict[str, Any]) -> bool:
     return bool(item and item.get("kv"))
 
+# ============================================================
+# 👥 Работа с актёрами и тегами
+# ============================================================
+
 def _actor_tags(item: Dict[str, Any], name: str) -> set:
     for a in (item.get("actors") or []):
         if a.get("name") == name:
-            # нормализуем теги в нижний регистр
-            return { _norm(t) for t in (a.get("tags") or []) }
+            return {_norm(t) for t in (a.get("tags") or [])}
     return set()
 
 def _has_actor(item: Dict[str, Any], name: str) -> bool:
@@ -77,64 +89,46 @@ def _has_actor(item: Dict[str, Any], name: str) -> bool:
 
 def _has_tag(item: Dict[str, Any], name: str, tag: str) -> bool:
     tags = _actor_tags(item, name)
-    # поддержим 'late' и 'later' как один смысл
     if tag == "late":
         return "late" in tags or "later" in tags
     return tag in tags
 
-def _has_gk(item: Dict[str, Any], name: str) -> bool:
-    return _has_tag(item, name, "gk")
-
-def _has_late(item: Dict[str, Any], name: str) -> bool:
-    return _has_tag(item, name, "late")
-
-def _has_early(item: Dict[str, Any], name: str) -> bool:
-    return _has_tag(item, name, "early")
-
+def _has_gk(item, name): return _has_tag(item, name, "gk")
+def _has_late(item, name): return _has_tag(item, name, "late")
+def _has_early(item, name): return _has_tag(item, name, "early")
 
 # ============================================================
-# ⚔️ Конфликты и ограничения
+# ⚔️ Конфликты: сильные и слабые
 # ============================================================
 
 def _shared_actors(left: Dict[str, Any], right: Dict[str, Any]) -> set:
     return {a["name"] for a in (left.get("actors") or [])} & {a["name"] for a in (right.get("actors") or [])}
 
 def _weak_conflict(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
-    """
-    «Слабый» конфликт по актёрам между соседними ПОЛНОЦЕННЫМИ номерами,
-    с учётом исключений: early (у левого) и late (у правого).
-    """
+    """Слабый конфликт: общий актёр, без gk, без early/late смягчений."""
     if not (_is_full_number(left) and _is_full_number(right)):
         return False
-    for name in _shared_actors(left, right):
-        # 'gk' — не слабый, рассмотрим в «сильном»
-        if _has_gk(left, name) or _has_gk(right, name):
+    for n in _shared_actors(left, right):
+        if _has_gk(left, n) or _has_gk(right, n):
             continue
-        # снимающие исключения
-        if _has_early(left, name) or _has_late(right, name):
+        if _has_early(left, n) or _has_late(right, n):
             continue
         return True
     return False
 
 def _adjacency_forbidden(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
-    """
-    Соседство недопустимо (сильный конфликт), если:
-      - два kv подряд;
-      - общий актёр и у одного из них gk (требуется «номер-буфер»).
-    """
+    """Строго запрещённое соседство: две КВ подряд, общий gk и т.п."""
     if not (_is_full_number(left) and _is_full_number(right)):
         return False
     if _is_kv(left) and _is_kv(right):
         return True
-    for name in _shared_actors(left, right):
-        if _has_gk(left, name) or _has_gk(right, name):
+    for n in _shared_actors(left, right):
+        if _has_gk(left, n) or _has_gk(right, n):
             return True
     return False
 
 def _has_kv_violation(program: List[Dict[str, Any]]) -> bool:
-    """
-    Для kv:true — между повторами подряд должен быть хотя бы один полноценный номер.
-    """
+    """Две КВ с разделителем только тянучками/спонсорами — запрещено."""
     last_kv = None
     for i, p in enumerate(program):
         if _is_full_number(p) and _is_kv(p):
@@ -146,16 +140,16 @@ def _has_kv_violation(program: List[Dict[str, Any]]) -> bool:
     return False
 
 def _has_gk_violation(program: List[Dict[str, Any]]) -> bool:
-    """
-    Для актёра с gk — между соседними появлениями должен быть хотя бы один полноценный номер.
-    """
-    last_seen: Dict[str, int] = {}
+    """Один и тот же актёр с gk в двух «номерах» без буфера из обычного номера — запрещено."""
+    last_seen = {}
     for i, p in enumerate(program):
         if not _is_full_number(p):
             continue
         for a in (p.get("actors") or []):
             name = a.get("name")
-            tags = { _norm(t) for t in (a.get("tags") or []) }
+            if not name:
+                continue
+            tags = {_norm(t) for t in (a.get("tags") or [])}
             if "gk" in tags:
                 if name in last_seen:
                     prev_i = last_seen[name]
@@ -165,18 +159,12 @@ def _has_gk_violation(program: List[Dict[str, Any]]) -> bool:
                 last_seen[name] = i
     return False
 
-def _count_weak_conflicts(program: List[Dict[str, Any]]) -> int:
-    c = 0
-    for i in range(len(program) - 1):
-        if _weak_conflict(program[i], program[i + 1]):
-            c += 1
-    return c
+def _count_weak_conflicts(program: List[Dict, Any]) -> int:
+    return sum(_weak_conflict(program[i], program[i + 1]) for i in range(len(program) - 1))
 
 def _strong_constraints_ok(program: List[Dict[str, Any]]) -> bool:
-    """Проверяем только «сильные» ограничения: kv/gk и прямое недопустимое соседство."""
-    if _has_kv_violation(program):
-        return False
-    if _has_gk_violation(program):
+    """Проверка жёстких ограничений."""
+    if _has_kv_violation(program) or _has_gk_violation(program):
         return False
     for i in range(len(program) - 1):
         if _adjacency_forbidden(program[i], program[i + 1]):
@@ -185,51 +173,55 @@ def _strong_constraints_ok(program: List[Dict[str, Any]]) -> bool:
 
 
 # ============================================================
-# 🧱 Фиксированные позиции (иммьютаблы)
+# 🧱 Фиксация зон (логическая, не по индексам)
+# — фиксируем: начало→2-й полноценный номер включительно;
+#              предпоследний полноценный→последний включительно;
+#              все «спонсоры» всегда фикс.
 # ============================================================
 
 def _fixed_zones(program: List[Dict[str, Any]]) -> Tuple[List[int], List[int]]:
-    """
-    Фиксируем:
-      - зону от начала до ВТОРОГО полноценного номера включительно (предкулисье/1/2 и тянучки/спонсоры между ними);
-      - зону от ПРЕДПОСЛЕДНЕГО полноценного номера до последнего включительно (и любые вставки между ними);
-      - все спонсоры — всегда фикс.
-
-    Возвращает (fixed_indexes, movable_indexes).
-    """
     n = len(program)
+    fixed = set()
     full_idxs = [i for i, p in enumerate(program) if _is_full_number(p)]
 
-    fixed = set()
+    if not full_idxs:
+        fixed.update(range(n))
+        return sorted(fixed), []
 
-    # зона начала → второму номеру включительно
+    # Зона 1: от начала до второго полноценного номера (включительно)
     if len(full_idxs) >= 2:
         second = full_idxs[1]
-        for i in range(0, second + 1):
+    else:
+        second = full_idxs[-1]
+    for i in range(0, second + 1):
+        fixed.add(i)
+
+    # Зона 2: от предпоследнего до последнего полноценного номера (включительно)
+    if len(full_idxs) >= 2:
+        prelast, last = full_idxs[-2], full_idxs[-1]
+        for i in range(prelast, last + 1):
             fixed.add(i)
     else:
-        # если вдруг меньше двух полноценных — фиксируем всё до конца
-        fixed.update(range(n))
+        fixed.add(full_idxs[0])
 
-    # зона предпоследний → последний номер включительно
-    if len(full_idxs) >= 2:
-        prev_last, last = full_idxs[-2], full_idxs[-1]
-        for i in range(prev_last, last + 1):
-            fixed.add(i)
-
-    # все спонсоры — фикс
+    # Всех спонсоров фиксируем всегда
     for i, p in enumerate(program):
         if _is_sponsor(p):
             fixed.add(i)
 
     fixed_list = sorted(fixed)
     movable = [i for i in range(n) if i not in fixed_list]
-    logger.debug(f"📍 Фиксированные позиции: {fixed_list}")
+    logger.info(
+        f"📍 Фикс: 0→{second}, "
+        f"{(full_idxs[-2] if len(full_idxs)>=2 else full_idxs[0])}→{full_idxs[-1]}, "
+        f"спонсоры зафиксированы. "
+        f"Итог: fixed={len(fixed_list)}, movable={len(movable)}"
+    )
     return fixed_list, movable
 
 
 # ============================================================
-# 🔁 Перебор базовых перестановок (без тянучек)
+# 🔁 Перебор/бэктрекинг (с возвратом лучшего при STOP)
 # ============================================================
 
 SLEEP_INTERVAL = 200
@@ -238,49 +230,44 @@ SLEEP_TIME = 0.02
 def _search_variants(program: List[Dict[str, Any]],
                      max_results: int = 100,
                      chat_id: Optional[int] = None,
-                     stop_event: Optional[threading.Event] = None
-                    ) -> Tuple[List[Tuple[int, List[Dict[str, Any]]]], int]:
-    """
-    Перебор перестановок (branch-and-bound):
-      - Уважает «сильные» ограничения (kv/gk/запрет соседства);
-      - Считает число «слабых» конфликтов (с учётом early/late);
-      - Возвращает до max_results лучших по возрастанию слабых конфликтов
-        + счётчик всех валидных по сильным ограничений вариантов.
-    """
+                     stop_event=None) -> Tuple[List[Tuple[int, List[Dict[str, Any]]]], int]:
     stop_event = stop_event or STOP_EVENT
     n = len(program)
     fixed, movable = _fixed_zones(program)
     movables = [program[i] for i in movable]
     random.shuffle(movables)
 
-    current: List[Optional[Dict[str, Any]]] = [None] * n
+    current = [None] * n
     for i in fixed:
         current[i] = copy.deepcopy(program[i])
 
     used = [False] * len(movables)
-
     best: List[Tuple[int, List[Dict[str, Any]]]] = []
     best_weak = float("inf")
     valid_count = 0
     iteration = 0
+    checked_total = 0
 
     def backtrack(pos: int):
-        nonlocal iteration, best_weak, valid_count
+        nonlocal iteration, best_weak, valid_count, checked_total
         if stop_event.is_set():
             raise StopComputation
-
-        # throttle
+        # throttling
         if iteration and iteration % SLEEP_INTERVAL == 0:
             time.sleep(SLEEP_TIME)
 
-        # пропускаем фиксированные
+        # пропускаем фиксированные позиции
         while pos < n and current[pos] is not None:
             if stop_event.is_set():
                 raise StopComputation
             pos += 1
 
+        # достигли конца — валидируем
         if pos >= n:
-            # полная перестановка — проверим сильные
+            checked_total += 1
+            if checked_total % 25 == 0:
+                wk = _count_weak_conflicts(current)
+                logger.debug(f"🧮 Проверен вариант №{checked_total} (слабых={wk})")
             if _strong_constraints_ok(current):
                 valid_count += 1
                 wk = _count_weak_conflicts(current)
@@ -290,7 +277,7 @@ def _search_variants(program: List[Dict[str, Any]],
                     if len(best) > max_results:
                         best[:] = best[:max_results]
                     best_weak = best[0][0]
-                    logger.debug(f"✅ Новый лучший базовый вариант (слабых={wk})")
+                    logger.debug(f"✅ Новый лучший вариант (слабых={wk}, всего лучших={len(best)})")
             iteration += 1
             return
 
@@ -303,14 +290,13 @@ def _search_variants(program: List[Dict[str, Any]],
                 continue
             el = movables[i]
 
-            # отсечка: нельзя сразу ставить то, что образует «сильный» конфликт слева
+            # быстрый отсев
             if left and _adjacency_forbidden(left, el):
                 continue
 
-            # грубая нижняя оценка слабых (только слева) — для отсечки
             add = 1 if (left and _weak_conflict(left, el)) else 0
-            tentative = add
-            if tentative > best_weak:
+            # если уже хуже текущего лучшего — дальше нет смысла
+            if add > best_weak:
                 continue
 
             current[pos] = el
@@ -321,71 +307,57 @@ def _search_variants(program: List[Dict[str, Any]],
 
         iteration += 1
 
+    # приветствие
     if chat_id:
         try:
             send_message(chat_id, "🚀 Начинаю реальный перебор вариантов. Это может занять пару минут ⏳")
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить уведомление: {e}")
+            logger.warning(f"⚠️ Не удалось уведомить пользователя перед стартом перебора: {e}")
 
+    # запуск
     try:
         backtrack(0)
     except StopComputation:
-        logger.warning("🚫 Перебор прерван по STOP.")
+        logger.warning("🚫 Перебор прерван по STOP (команда /stop). Возвращаю лучшее найденное.")
+        # важно: даже при стопе — вернуть то, что уже было найдено
         return best, valid_count
 
-    logger.info(f"🔎 Перебор завершён: валидных (по «сильным»)={valid_count}, лучший слабых={best[0][0] if best else '—'}")
+    logger.info(
+        f"🔎 Завершён перебор: проверено={checked_total}, валидных={valid_count}, "
+        f"лучший_слабых={(best[0][0] if best else '—')}, всего_лучших={len(best)}"
+    )
     return best, valid_count
 
 
 # ============================================================
-# 🪶 Тянучки: допустимость и вставка
+# 🪶 Тянучки — вставка по правилам приоритета
+# Приоритет: Пушкин → Исаев → Рожков
+# Условия (как ты просил):
+#  1) если у актёра есть gk в левом или правом номере — запрещено;
+#  2) если он есть в правом номере БЕЗ тегов — запрещено;
+#  3) если он есть в правом номере с тегом late — можно;
+#  4) если его нет в правом номере — можно.
 # ============================================================
 
-def _can_actor_host_tyan(program: List[Dict[str, Any]], insert_left_idx: int, actor: str) -> bool:
-    """
-    Строгий чек допустимости ведущего тянучки перед позицией insert_left_idx+1:
-
-    НЕЛЬЗЯ, если ЛЮБОЕ из:
-      - в следующем полноценном номере тот же актёр и у него есть gk;
-      - в предыдущем полноценном номере тот же актёр и у него есть gk;
-      - в следующем полноценном номере тот же актёр присутствует и у него НЕТ тега 'late' (или 'later').
-
-    Разрешается во всех остальных случаях (в т.ч. если актёр встречается через один номер — R+2, или больше не встречается).
-    """
-    n = len(program)
-    prev_i = insert_left_idx
-    next_i = insert_left_idx + 1
-
-    if 0 <= prev_i < n and _is_full_number(program[prev_i]):
-        prev = program[prev_i]
-        if _has_gk(prev, actor):
-            return False
-
-    if 0 <= next_i < n and _is_full_number(program[next_i]):
-        nxt = program[next_i]
-        if _has_gk(nxt, actor):
-            return False
-        if _has_actor(nxt, actor) and not _has_late(nxt, actor):
-            return False
-
+def _can_pick_host_for_gap(left: Dict[str, Any], right: Dict[str, Any], actor: str) -> bool:
+    # 1) GK в левом или правом — запрещено
+    if _has_gk(left, actor) or _has_gk(right, actor):
+        return False
+    # 2) есть в правом без тегов — нельзя
+    if _has_actor(right, actor) and not _has_late(right, actor):
+        return False
+    # 3) есть с late — можно; 4) нет в правом — можно
     return True
 
 def _insert_tyanuchki_exact(program: List[Dict[str, Any]], max_tyan: int) -> Tuple[List[Dict[str, Any]], int, bool]:
-    """
-    Пытаемся погасить все слабые конфликты, вставляя тянучки (не более max_tyan).
-    Ведущие — строго по приоритету: Пушкин → Исаев → Рожков.
-    Актёр НЕ обязан быть участником конфликтующих номеров — проверяется только допустимость.
-    Если для конкретной пары не найден допустимый ведущий — эскалируем в «сильный» (возврат success=False).
-    """
     prog = copy.deepcopy(program)
-    tcount = 0
-    priority = ["Пушкин", "Исаев", "Рожков"]
-
+    count_added = 0
+    leaders = ["Пушкин", "Исаев", "Рожков"]
     i = 0
     while i < len(prog) - 1:
         if STOP_EVENT.is_set():
             raise StopComputation
-        if tcount >= max_tyan:  # FIX: >= — как только достигли лимита, корректно выходим из цикла
+        if count_added >= max_tyan:
             break
 
         left, right = prog[i], prog[i + 1]
@@ -394,180 +366,166 @@ def _insert_tyanuchki_exact(program: List[Dict[str, Any]], max_tyan: int) -> Tup
             continue
 
         if _weak_conflict(left, right):
-            if tcount >= max_tyan:
-                break  # FIX: не возвращаем False преждевременно, завершаем фазу вставок
+            chosen = None
+            for a in leaders:
+                if _can_pick_host_for_gap(left, right, a):
+                    chosen = a
+                    reason = "нет gk и допустим по next/late" if not _has_actor(right, a) else "в next с late"
+                    logger.info(f"🎯 Выбран ведущий для тянучки: {a} ({reason}) между «{left.get('title','')}» и «{right.get('title','')}»")
+                    break
+                else:
+                    logger.debug(f"⛔ {a}: не подходит для тянучки между "
+                                 f"«{left.get('title','')}» и «{right.get('title','')}» (gk или присутствует в next без late)")
 
-            placed = False
-            for actor in priority:
-                if STOP_EVENT.is_set():
-                    raise StopComputation
-                if not _can_actor_host_tyan(prog, i, actor):
-                    continue
+            if not chosen:
+                logger.warning(f"⚠️ Не удалось подобрать ведущего для тянучки между "
+                               f"«{left.get('title','')}» и «{right.get('title','')}» — конфликт временно остаётся")
+                i += 1
+                continue
 
-                # Добавляем тянучку
-                t = {
-                    "order": None,
-                    "num": "",
-                    "title": f"Тянучка ({actor})",
-                    "actors_raw": actor,
-                    "pp": "",
-                    "hire": "",
-                    "responsible": actor,
-                    "kv": False,
-                    "type": "тянучка",
-                    "actors": [{"name": actor, "tags": []}],
-                }
-                prog.insert(i + 1, t)
-                tcount += 1
-                placed = True
-                logger.info(f"➕ Добавлена тянучка ({actor}) между «{left.get('title','')}» и «{right.get('title','')}» (#{tcount})")
-                break
-
-            if not placed:
-                logger.debug("⛔ Ни один из ведущих (Пушкин/Исаев/Рожков) не прошёл критерии — эскалация в сильный.")
-                return prog, tcount, False
-
-            # после успешной вставки перескочим через вставленную тянучку
+            t = {
+                "order": None, "num": "", "title": f"Тянучка ({chosen})",
+                "actors_raw": chosen, "pp": "", "hire": "",
+                "responsible": chosen, "kv": False, "type": "тянучка",
+                "actors": [{"name": chosen, "tags": []}],
+            }
+            prog.insert(i + 1, t)
+            count_added += 1
+            logger.info(f"➕ Добавлена тянучка ({chosen}) между «{left.get('title','')}» и «{right.get('title','')}» (всего={count_added})")
+            # через вставку шагаем на +2: left, tyan, right
             i += 2
             continue
 
         i += 1
 
-    # финальная проверка — слабых конфликтов не осталось?
-    if _count_weak_conflicts(prog) == 0:
-        return prog, tcount, True
-    return prog, tcount, False
+    ok = _count_weak_conflicts(prog) == 0
+    return prog, count_added, ok
 
 
 # ============================================================
-# 🧾 Форматирование топ-вариантов
+# 🧾 Форматирование / метрики (для расширенных логов)
 # ============================================================
 
-def _format_variant_line(program: List[Dict[str, Any]]) -> str:
-    """Короткая строка: названия ПОЛНОЦЕННЫХ номеров через ' — ' (без тянучек/спонсоров/предкулисья)"""
-    titles = [p.get("title", "") for p in program if _is_full_number(p)]
-    return " — ".join(titles)
+def _summary_titles(program: List[Dict[str, Any]]) -> str:
+    """Короткая строка с названиями — удобно в логах при отладке."""
+    titles = []
+    for p in program:
+        if _is_full_number(p):
+            titles.append(p.get("title") or "№")
+        elif _is_tyan(p):
+            titles.append("ТЯН")
+        elif _is_sponsor(p):
+            titles.append("СПОН")
+        elif _is_prekulisse(p):
+            titles.append("ПРЕД")
+        else:
+            titles.append("·")
+    return " | ".join(titles)
 
 
 # ============================================================
-# 🎯 Главная функция
+# 🎯 Главная функция: генерация
+# — поддержка внешнего stop_event
+# — layered-проход по максимальному количеству тянучек (0→3)
+# — возврат лучшего при STOP
 # ============================================================
 
 def generate_program_variants(program: List[Dict[str, Any]],
                               chat_id: Optional[int] = None,
-                              top_n: int = 5) -> Tuple[List[List[Dict[str, Any]]], Dict[str, Any]]:
+                              top_n: int = 5,
+                              stop_event=None):
     """
-    Возвращает ([лучшие_варианты], статистика).
-
-    Алгоритм:
-      1) Перебор базовых перестановок, соблюдающих «сильные» правила (kv/gk).
-         Сортировка по числу «слабых» конфликтов.
-      2) Ранняя остановка по слоям допустимых тянучек: 0 → 1 → 2 → 3.
-         На каждом слое пытаемся погасить все «слабые» тянучками (по приоритету ведущих).
-      3) Если ни на одном слое не получилось, возвращаем лучший базовый вариант без вставок.
-
-    Уважает STOP и возвращает лучшее из найденного на момент остановки.
+    Возвращает: ([лучшие_решения], статистика).
+    При STOP возвращает лучший найденный на момент остановки (включая попытку вставки тянучек).
     """
-    reset_stop()
-    logger.info("🧩 Подготовка к генерации вариантов программы...")
+    # подключаем внешний STOP, если передан (multiprocessing.Event)
+    if stop_event is not None:
+        set_external_stop_event(stop_event)
+    else:
+        reset_stop()
+
+    logger.info("🧩 Подготовка к генерации вариантов программы…")
 
     if chat_id:
         try:
-            send_message(chat_id, "📦 Подготовка данных... скоро начнётся реальный перебор ⏳")
+            send_message(chat_id, "📦 Подготовка данных… скоро начнётся реальный перебор ⏳")
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить сообщение в Telegram: {e}")
+            logger.warning(f"⚠️ Не удалось отправить сообщение о подготовке: {e}")
 
     if not program or len(program) < 2:
-        base_weak = _count_weak_conflicts(program)
+        base = _count_weak_conflicts(program or [])
         stats = {
             "checked_variants": 0,
-            "valid_variants_count": 1 if _strong_constraints_ok(program) else 0,
-            "initial_conflicts": base_weak,
-            "final_conflicts": base_weak,
+            "valid_variants": 1 if _strong_constraints_ok(program or []) else 0,
+            "initial_conflicts": base,
+            "final_conflicts": base,
             "tyanuchki_added": 0,
-            "best_tyanuchki": 0,
-            "top_variants_lines": [_format_variant_line(program)],
         }
         return [program], stats
 
-    # 1) базовые перестановки
-    base_best, valid_count = _search_variants(program, chat_id=chat_id, stop_event=STOP_EVENT, max_results=100)
+    # 1) Перебираем перестановки (возвращает несколько лучших по слабым конфликтам)
+    best, valid_count = _search_variants(program, chat_id=chat_id, stop_event=STOP_EVENT)
 
-    if not base_best:
-        # вообще нет валидных по «сильным»
-        base_weak = _count_weak_conflicts(program)
+    if not best:
+        base = _count_weak_conflicts(program)
         stats = {
             "checked_variants": 0,
-            "valid_variants_count": 0,
-            "initial_conflicts": base_weak,
-            "final_conflicts": base_weak,
+            "valid_variants": 0,
+            "initial_conflicts": base,
+            "final_conflicts": base,
             "tyanuchki_added": 0,
-            "best_tyanuchki": None,
-            "top_variants_lines": [],
         }
+        logger.warning("⚠️ Валидных перестановок не найдено — возвращаю исходный порядок.")
         return [program], stats
 
-    # 2) ранняя остановка по слоям 0/1/2/3
-    best_solution: Optional[List[Dict[str, Any]]] = None
-    best_layer: Optional[int] = None
-    best_inserted = 0
+    # 2) Многослойная попытка «доведения до 0» тянучками
+    best_solution = None
+    best_layer = None
+    best_added = 0
+    initial_best_conf = best[0][0]  # слабые конфликты у лучшего бэйс-варианта
+    best_base_candidate = copy.deepcopy(best[0][1])
 
     try:
-        for layer_limit in [0, 1, 2, 3]:
+        for layer in (0, 1, 2, 3):
             if STOP_EVENT.is_set():
                 raise StopComputation
-            for wk, cand in base_best:
+            # пробуем применить слой ко всем отобранным base-кандидатам,
+            # но ускоряемся — не трогаем те, у кого слабых конфликтов > layer
+            for wk, cand in best:
                 if STOP_EVENT.is_set():
                     raise StopComputation
-                # если слабых больше, чем разрешённый лимит тянучек — смысла пробовать нет
-                if wk > layer_limit:
+                if wk > layer:
                     continue
-                prog2, ins, ok = _insert_tyanuchki_exact(cand, max_tyan=layer_limit)
+                prog2, added, ok = _insert_tyanuchki_exact(cand, max_tyan=layer)
                 if ok:
-                    best_solution = prog2
-                    best_layer = layer_limit
-                    best_inserted = ins
-                    logger.success(f"🎯 Достигнута цель слоя {layer_limit}: слабые=0, тянучек добавлено={ins}")
-                    raise StopComputation  # используем исключение для быстрого выхода из двух циклов
+                    best_solution, best_layer, best_added = prog2, layer, added
+                    logger.success(f"🎯 Уровень {layer}: слабых=0, добавлено тянучек={added}")
+                    raise StopComputation
     except StopComputation:
-        # если мы попали сюда через достижение цели — best_solution уже установлен
-        if best_solution is None:
-            logger.warning("🚫 Остановка до достижения решения — вернём лучшее из найденного ниже.")
+        pass
 
-    # Если не найдено на слоях (или остановились слишком рано) — попробуем лучший базовый с лимитом 3.
     if best_solution is None:
-        wk, cand = base_best[0]
+        # не смогли обнулить слабые конфликты тянучками в рамках лимитов
+        # отдаём лучший base-кандидат, попробовав максимум тянучек для него
         try:
-            prog2, ins, ok = _insert_tyanuchki_exact(cand, max_tyan=3)
+            prog2, added, ok = _insert_tyanuchki_exact(best_base_candidate, max_tyan=3)
+            if ok:
+                best_solution, best_layer, best_added = prog2, 3, added
+            else:
+                best_solution, best_layer, best_added = best_base_candidate, None, 0
         except StopComputation:
-            # на STOP берём то, что уже было лучшим базовым
-            prog2, ins, ok = cand, 0, False
+            # если стоп прямо во время вставки — отдаём то, что уже есть
+            best_solution, best_layer, best_added = best_base_candidate, None, 0
 
-        if ok:
-            best_solution = prog2
-            best_layer = 3
-            best_inserted = ins
-        else:
-            # вернём лучший базовый без вставок
-            best_solution = cand
-            best_layer = None
-            best_inserted = 0
-
-    # Сформируем топ-строки (до 5)
-    top_lines: List[str] = []
-    for i, (wk, cand) in enumerate(sorted(base_best, key=lambda x: x[0])[:min(top_n, 5)], start=1):
-        top_lines.append(f"{i}) слабых={wk} | " + _format_variant_line(cand))
-
-    final_weak = _count_weak_conflicts(best_solution)
+    final_conf = _count_weak_conflicts(best_solution)
+    logger.info("🧾 Итоговый порядок:\n" + _summary_titles(best_solution))
+    logger.success(f"✅ Итог: слабых {initial_best_conf} → {final_conf}, тянучек добавлено={best_added}, слой={best_layer}")
 
     stats = {
-        "checked_variants": 0,              # считаем валидные, а не все посещения
-        "valid_variants_count": valid_count,
-        "initial_conflicts": None,          # не всегда осмысленно для перестановок
-        "final_conflicts": final_weak,
-        "tyanuchki_added": best_inserted,
-        "best_tyanuchki": best_layer,       # 0/1/2/3 либо None, если не удалось
-        "top_variants_lines": top_lines,
+        "checked_variants": valid_count,
+        "initial_conflicts": initial_best_conf,
+        "final_conflicts": final_conf,
+        "tyanuchki_added": best_added,
+        "best_layer": best_layer,
     }
-
     return [best_solution], stats
