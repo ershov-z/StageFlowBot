@@ -1,9 +1,11 @@
 # bot/main.py
 # ============================================================
 # 🧠 Telegram бот для автоматического подбора программы концерта
+# (оптимизирован для работы на Koyeb)
 # ============================================================
 
-import os, sys, json, math, time, threading, requests
+import os, sys, json, math, time, threading, requests, multiprocessing
+from queue import Queue
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -21,7 +23,14 @@ from utils.telegram_utils import send_message, send_document
 # ------------------------------------------------------------
 os.makedirs("logs", exist_ok=True)
 os.makedirs("data", exist_ok=True)
-logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
+
+logger.add(
+    "logs/bot_{time:YYYYMMDD}.log",
+    rotation="10 MB",
+    retention="7 days",
+    compression="zip",
+    level="DEBUG",
+)
 
 app_health = Flask(__name__)
 
@@ -50,7 +59,7 @@ def start_keep_alive():
     def loop():
         while True:
             try:
-                requests.get(url)
+                requests.get(url, timeout=10)
                 logger.debug(f"[keep-alive] Пинг {url} успешен")
             except Exception as e:
                 logger.warning(f"[keep-alive] Ошибка keep-alive: {e}")
@@ -65,6 +74,12 @@ TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
     logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN)")
     sys.exit(1)
+
+# ------------------------------------------------------------
+# Путь к списку актёров (для стабильной загрузки в Koyeb)
+# ------------------------------------------------------------
+ACTORS_PATH = Path(__file__).resolve().parent / "actors_list.json"
+os.environ["ACTORS_PATH"] = str(ACTORS_PATH)
 
 # ------------------------------------------------------------
 # STOP
@@ -89,12 +104,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ------------------------------------------------------------
-# ПРОГРЕСС-МОНТОР (отдельный поток)
+# ПРОГРЕСС-МОНТОР
 # ------------------------------------------------------------
 def progress_notifier(chat_id, stop_flag):
     logger.info(f"🔔 Прогресс-монитор запущен для chat_id={chat_id}")
     while not stop_flag.is_set():
-        time.sleep(60)
+        time.sleep(180)  # уведомление раз в 3 минуты, чтобы избежать flood limit
         if stop_flag.is_set():
             break
         try:
@@ -104,7 +119,12 @@ def progress_notifier(chat_id, stop_flag):
     logger.info(f"🛑 Монитор завершён для chat_id={chat_id}")
 
 # ------------------------------------------------------------
-# ОСНОВНАЯ ГЕНЕРАЦИЯ (в отдельном потоке)
+# ОГРАНИЧЕНИЕ ОДНОВРЕМЕННЫХ ЗАДАЧ
+# ------------------------------------------------------------
+TASK_QUEUE = Queue(maxsize=3)
+
+# ------------------------------------------------------------
+# ОСНОВНАЯ ГЕНЕРАЦИЯ
 # ------------------------------------------------------------
 def run_generation(data, document, user_id, username, timestamp):
     try:
@@ -120,7 +140,6 @@ def run_generation(data, document, user_id, username, timestamp):
         elapsed = f"{int(elapsed_sec // 60)} мин {int(elapsed_sec % 60)} сек"
         logger.info(f"✅ Расчёт завершён для @{username}, время: {elapsed}")
 
-        # === Формирование и отправка результатов ===
         if not variants:
             send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
             return
@@ -151,7 +170,7 @@ def run_generation(data, document, user_id, username, timestamp):
         else:
             msg += "\n\n✅ Без тянучек!"
 
-        send_message(user_id, f"📤 Отправляю итоговые документы... ⏳")
+        send_message(user_id, "📤 Отправляю итоговые документы... ⏳")
         send_document(user_id, str(result_json_path), "📗 Итоговая программа (JSON):")
         send_document(user_id, str(out_path), msg)
         send_message(user_id, f"✅ Готово! Время: {elapsed}")
@@ -163,6 +182,11 @@ def run_generation(data, document, user_id, username, timestamp):
             send_message(user_id, f"❌ Ошибка: {e}")
         except Exception as e2:
             logger.error(f"Не удалось уведомить пользователя об ошибке: {e2}")
+    finally:
+        # освобождаем слот в очереди
+        if "TASK_QUEUE" in globals():
+            TASK_QUEUE.get()
+            TASK_QUEUE.task_done()
 
 # ------------------------------------------------------------
 # ОБРАБОТКА ДОКУМЕНТОВ
@@ -178,6 +202,12 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"⚠️ @{username} отправил неподдерживаемый файл: {document.file_name}")
         return
 
+    if TASK_QUEUE.full():
+        await update.message.reply_text("⚠️ Сервер сейчас занят, попробуй позже.")
+        logger.warning(f"⚠️ Пропуск задачи: очередь переполнена (пользователь @{username})")
+        return
+    TASK_QUEUE.put(1)
+
     file = await document.get_file()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_path = Path(f"data/{timestamp}__{document.file_name}")
@@ -189,7 +219,9 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(parsed_json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
+    # безопасное закрытие файла
+    with open(parsed_json_path, "rb") as f:
+        await update.message.reply_document(f, caption="📘 Исходные данные после парсинга:")
     logger.info(f"📄 JSON отправлен пользователю @{username}: {parsed_json_path}")
 
     movable = [i for i, x in enumerate(data)
@@ -206,13 +238,14 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
     logger.info(f"📊 Начинается расчёт {count}! вариантов для @{username}")
 
-    thread = threading.Thread(
+    # запуск расчёта в отдельном процессе
+    process = multiprocessing.Process(
         target=run_generation,
         args=(data, document, user.id, username, timestamp),
         daemon=True,
     )
-    thread.start()
-    logger.info(f"🚀 Поток генерации запущен (tid={thread.ident}) для @{username}")
+    process.start()
+    logger.info(f"🚀 Подпроцесс генерации запущен (pid={process.pid}) для @{username}")
 
 # ------------------------------------------------------------
 # MAIN
