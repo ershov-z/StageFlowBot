@@ -11,6 +11,3 @@ build:
 
 run:
   command: python -m bot.main
-  healthcheck:
-    path: /health
-    interval: 240s
