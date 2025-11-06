@@ -1,1 +1,1 @@
-web: python -m bot.main
+python3 -m bot.main
