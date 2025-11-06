@@ -1,6 +1,6 @@
 # utils/validator.py
 # ============================================================
-# 🎯 Валидатор и подбор программы с расширенным логированием
+# 🎯 Валидатор и подбор программы с расширенным логированием и корректной вставкой тянучек
 # ============================================================
 
 import copy
@@ -54,6 +54,7 @@ def _has_tag(item, name, tag):
         return "late" in tags or "later" in tags
     return tag in tags
 
+def _has_actor(item, name): return any(a.get("name") == name for a in (item.get("actors") or []))
 def _has_gk(item, name): return _has_tag(item, name, "gk")
 def _has_late(item, name): return _has_tag(item, name, "late")
 def _has_early(item, name): return _has_tag(item, name, "early")
@@ -90,7 +91,6 @@ def _count_weak_conflicts(prog):
     return sum(_weak_conflict(prog[i], prog[i+1]) for i in range(len(prog)-1))
 
 def _strong_constraints_ok(program):
-    # Проверка kv/gk ограничений
     seen_gk = {}
     last_kv = None
     for i, p in enumerate(program):
@@ -112,7 +112,6 @@ def _strong_constraints_ok(program):
                     if not any(_is_full_number(x) for x in between):
                         return False
                 seen_gk[name] = i
-    # запрет соседства
     for i in range(len(program) - 1):
         if _adjacency_forbidden(program[i], program[i+1]):
             return False
@@ -240,6 +239,15 @@ def _search_variants(program, chat_id=None, stop_event=None, max_results=100):
 # ============================================================
 
 def _insert_tyanuchki_exact(program, max_tyan):
+    """
+    Вставка тянучек между конфликтными номерами с правильной логикой выбора ведущего.
+    Приоритет актёров: Пушкин → Исаев → Рожков.
+    Условия вставки:
+      1. У актёра есть GK в левом или правом номере — запрещено.
+      2. Актёр есть в следующем номере без тегов — запрещено.
+      3. Актёр есть в следующем номере с тегом 'late' — разрешено.
+      4. Актёра нет в следующем номере — разрешено.
+    """
     prog = copy.deepcopy(program)
     count = 0
     leaders = ["Пушкин", "Исаев", "Рожков"]
@@ -247,23 +255,38 @@ def _insert_tyanuchki_exact(program, max_tyan):
     while i < len(prog) - 1:
         if STOP_EVENT.is_set():
             raise StopComputation
-        l, r = prog[i], prog[i+1]
-        if not (_is_full_number(l) and _is_full_number(r)):
+        left, right = prog[i], prog[i+1]
+        if not (_is_full_number(left) and _is_full_number(right)):
             i += 1
             continue
-        if _weak_conflict(l, r) and count < max_tyan:
-            for a in leaders:
-                if _has_gk(l, a) or _has_gk(r, a):
+
+        if _weak_conflict(left, right) and count < max_tyan:
+            placed = False
+            for actor in leaders:
+                # 1. Проверка GK
+                if _has_gk(left, actor) or _has_gk(right, actor):
+                    logger.debug(f"⛔ {actor}: имеет GK — пропуск")
                     continue
-                t = {
-                    "title": f"Тянучка ({a})", "type": "тянучка",
-                    "actors_raw": a, "actors": [{"name": a, "tags": []}],
-                    "pp": "", "hire": "", "responsible": a, "kv": False,
-                }
-                prog.insert(i+1, t)
-                count += 1
-                logger.info(f"➕ Добавлена тянучка ({a}) между «{l.get('title')}» и «{r.get('title')}»")
-                break
+                # 2. Есть в правом номере без late — нельзя
+                if _has_actor(right, actor) and not _has_late(right, actor):
+                    logger.debug(f"⛔ {actor}: есть в правом номере без late — пропуск")
+                    continue
+                # 3. Можно, если нет в правом номере или есть с late
+                if not _has_actor(right, actor) or _has_late(right, actor):
+                    logger.info(f"🎯 Выбран {actor} для тянучки между «{left.get('title')}» и «{right.get('title')}»")
+                    t = {
+                        "title": f"Тянучка ({actor})", "type": "тянучка",
+                        "actors_raw": actor, "actors": [{"name": actor, "tags": []}],
+                        "pp": "", "hire": "", "responsible": actor, "kv": False,
+                    }
+                    prog.insert(i+1, t)
+                    count += 1
+                    placed = True
+                    break
+            if not placed:
+                logger.warning(f"⚠️ Никто не подошёл для тянучки между «{left.get('title')}» и «{right.get('title')}»")
+            i += 2
+            continue
         i += 1
     ok = _count_weak_conflicts(prog) == 0
     return prog, count, ok
