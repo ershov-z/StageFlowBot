@@ -7,7 +7,7 @@ from aiogram.types import BufferedInputFile
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from core import file_manager
+from bot import file_manager
 
 # === Инициализация бота ===
 TOKEN = "YOUR_BOT_TOKEN_HERE"
