@@ -3,7 +3,7 @@
 # 🧠 Telegram бот для автоматического подбора программы концерта
 # ============================================================
 
-import os, sys, json, math, time, threading, requests, asyncio
+import os, sys, json, math, time, threading, requests
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -14,6 +14,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from utils.docx_reader import read_program
 from utils.validator import generate_program_variants, request_stop
 from utils.docx_writer import save_program_to_docx
+from utils.telegram_utils import send_message, send_document
 
 # ------------------------------------------------------------
 # ЛОГИРОВАНИЕ И HEALTH-CHECK
@@ -66,27 +67,6 @@ if not TOKEN:
     sys.exit(1)
 
 # ------------------------------------------------------------
-# УТИЛИТЫ
-# ------------------------------------------------------------
-def format_duration(s: float) -> str:
-    m, sec = divmod(int(s), 60)
-    return f"{m} мин {sec} сек" if m else f"{sec} сек"
-
-
-def run_async_safely(coro_func):
-    """Запускает корутину безопасно из любого потока"""
-    try:
-        # если event loop уже существует
-        loop = asyncio.get_running_loop()
-        loop.create_task(coro_func())
-    except RuntimeError:
-        # если вызывается из обычного потока — создаём новый цикл
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(coro_func())
-        loop.close()
-
-# ------------------------------------------------------------
 # STOP
 # ------------------------------------------------------------
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,16 +91,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------
 # ПРОГРЕСС-МОНТОР (отдельный поток)
 # ------------------------------------------------------------
-def progress_notifier(context, chat_id, stop_flag):
+def progress_notifier(chat_id, stop_flag):
     logger.info(f"🔔 Прогресс-монитор запущен для chat_id={chat_id}")
     while not stop_flag.is_set():
         time.sleep(60)
         if stop_flag.is_set():
             break
         try:
-            run_async_safely(
-                lambda: context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
-            )
+            send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить статус пользователю {chat_id}: {e}")
     logger.info(f"🛑 Монитор завершён для chat_id={chat_id}")
@@ -128,71 +106,61 @@ def progress_notifier(context, chat_id, stop_flag):
 # ------------------------------------------------------------
 # ОСНОВНАЯ ГЕНЕРАЦИЯ (в отдельном потоке)
 # ------------------------------------------------------------
-def run_generation(data, document, user_id, username, timestamp, context):
+def run_generation(data, document, user_id, username, timestamp):
     try:
         start_time = time.time()
         stop_flag = threading.Event()
-        threading.Thread(target=progress_notifier, args=(context, user_id, stop_flag), daemon=True).start()
+        threading.Thread(target=progress_notifier, args=(user_id, stop_flag), daemon=True).start()
 
         logger.info(f"📦 Запуск generate_program_variants() для @{username}")
         variants, stats = generate_program_variants(data, chat_id=user_id)
         stop_flag.set()
 
-        elapsed = format_duration(time.time() - start_time)
+        elapsed_sec = time.time() - start_time
+        elapsed = f"{int(elapsed_sec // 60)} мин {int(elapsed_sec % 60)} сек"
         logger.info(f"✅ Расчёт завершён для @{username}, время: {elapsed}")
 
-        async def send_final():
-            try:
-                if not variants:
-                    await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
-                    return
+        # === Формирование и отправка результатов ===
+        if not variants:
+            send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
+            return
 
-                result = variants[0]
-                result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
-                with open(result_json_path, "w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
-                logger.info(f"📤 JSON сохранён: {result_json_path}")
+        result = variants[0]
+        result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
+        with open(result_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        logger.info(f"📤 JSON сохранён: {result_json_path}")
 
-                out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
-                out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
-                logger.info(f"📄 DOCX сгенерирован: {out_path}")
+        out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
+        out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
+        logger.info(f"📄 DOCX сгенерирован: {out_path}")
 
-                final_conf = stats.get("final_conflicts", 0) or 0
-                msg = (
-                    f"🎬 Программа собрана!\n"
-                    f"🕓 Время: {elapsed}\n"
-                    f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
-                    f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
-                    f"Оставшиеся слабые конфликты (до тянучек): {final_conf}\n"
-                    f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
-                )
+        final_conf = stats.get("final_conflicts", 0) or 0
+        msg = (
+            f"🎬 Программа собрана!\n"
+            f"🕓 Время: {elapsed}\n"
+            f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
+            f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
+            f"Оставшиеся слабые конфликты (до тянучек): {final_conf}\n"
+            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
+        )
 
-                tyan_titles = [x["title"] for x in result if x.get("type") == "тянучка"]
-                if tyan_titles:
-                    msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
-                else:
-                    msg += "\n\n✅ Без тянучек!"
+        tyan_titles = [x["title"] for x in result if x.get("type") == "тянучка"]
+        if tyan_titles:
+            msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+        else:
+            msg += "\n\n✅ Без тянучек!"
 
-                await context.bot.send_message(user_id, f"✅ Готово! Время: {elapsed}")
-                with open(result_json_path, "rb") as jf:
-                    await context.bot.send_document(jf, caption="📗 Итоговая программа (JSON):")
-                with open(out_path, "rb") as df:
-                    await context.bot.send_document(df, caption=msg)
-                logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
-            except Exception as e:
-                logger.exception(f"Ошибка в send_final для @{username}: {e}")
-                try:
-                    await context.bot.send_message(user_id, f"❌ Ошибка при отправке итогов: {e}")
-                except Exception as e2:
-                    logger.error(f"Не удалось уведомить пользователя: {e2}")
-
-        # 🧠 Запуск безопасного вызова корутины из потока
-        run_async_safely(send_final)
+        send_message(user_id, f"📤 Отправляю итоговые документы... ⏳")
+        send_document(user_id, str(result_json_path), "📗 Итоговая программа (JSON):")
+        send_document(user_id, str(out_path), msg)
+        send_message(user_id, f"✅ Готово! Время: {elapsed}")
+        logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
         try:
-            run_async_safely(lambda: context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+            send_message(user_id, f"❌ Ошибка: {e}")
         except Exception as e2:
             logger.error(f"Не удалось уведомить пользователя об ошибке: {e2}")
 
@@ -240,7 +208,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thread = threading.Thread(
         target=run_generation,
-        args=(data, document, user.id, username, timestamp, context),
+        args=(data, document, user.id, username, timestamp),
         daemon=True,
     )
     thread.start()
