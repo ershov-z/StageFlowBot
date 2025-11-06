@@ -104,7 +104,12 @@ def progress_notifier(context, chat_id, stop_flag):
         if stop_flag.is_set():
             break
         try:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
+            # безопасно получаем event loop и вызываем асинхронную задачу
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop_policy().get_event_loop()
+
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(
                     chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
