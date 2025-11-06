@@ -25,13 +25,16 @@ logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
 app_health = Flask(__name__)
 
 @app_health.route("/")
-def root(): return "OK"
+def root(): 
+    return "OK"
 
 @app_health.route("/health")
-def health(): return {"status": "healthy"}, 200
+def health(): 
+    return {"status": "healthy"}, 200
 
 def start_health_server():
-    def run(): app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
+    def run(): 
+        app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
     threading.Thread(target=run, daemon=True).start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
 
@@ -76,7 +79,9 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
     request_stop()
-    await update.message.reply_text("📨 Получен сигнал на остановку. Расчёт будет завершён — ожидайте итоговый вариант...")
+    await update.message.reply_text(
+        "📨 Получен сигнал на остановку. Расчёт будет завершён — ожидайте итоговый вариант..."
+    )
 
 # ------------------------------------------------------------
 # START
@@ -100,10 +105,11 @@ def progress_notifier(context, chat_id, stop_flag):
         if stop_flag.is_set():
             break
         try:
-            # безопасно отправляем из другого потока
             loop.call_soon_threadsafe(
-                lambda: context.application.create_task(
-                    context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
+                lambda: loop.create_task(
+                    context.bot.send_message(
+                        chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
+                    )
                 )
             )
         except Exception as e:
@@ -162,11 +168,16 @@ def run_generation(data, document, user_id, username, timestamp, context):
             await context.bot.send_document(open(out_path, "rb"), caption=msg)
             logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
-        context.application.create_task(send_final())
+        # 🔧 ВАЖНО: безопасный запуск в основном loop
+        loop = context.application.loop
+        loop.call_soon_threadsafe(lambda: loop.create_task(send_final()))
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        context.application.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+        loop = context.application.loop
+        loop.call_soon_threadsafe(
+            lambda: loop.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+        )
 
 # ------------------------------------------------------------
 # ОБРАБОТКА ДОКУМЕНТОВ
