@@ -1,11 +1,14 @@
 # bot/main.py
+# ============================================================
+# 🧠 Telegram бот для автоматического подбора программы концерта
+# ============================================================
 
 import os
 import sys
 import json
 import math
 import time
-import multiprocessing
+import threading
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -21,15 +24,11 @@ from telegram.ext import (
 )
 
 from utils.docx_reader import read_program
-from utils.validator import (
-    generate_program_variants,
-    request_stop,   # 🛑 STOP FEATURE
-)
+from utils.validator import generate_program_variants, request_stop
 from utils.docx_writer import save_program_to_docx
-from utils.telegram_utils import send_message  # ✅ для отправки сообщений из процесса
 
 # ============================================================
-# ЛОГИРОВАНИЕ И HEALTH-CHECK
+# 🔧 ЛОГИРОВАНИЕ И HEALTH-CHECK
 # ============================================================
 
 os.makedirs("logs", exist_ok=True)
@@ -49,13 +48,12 @@ def health_check():
 def start_health_server():
     def run():
         app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
-    proc = multiprocessing.Process(target=run, daemon=True)
-    proc.start()
+    threading.Thread(target=run, daemon=True).start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
 
 
 # ============================================================
-# KEEP-ALIVE
+# 🩵 KEEP-ALIVE
 # ============================================================
 
 def start_keep_alive():
@@ -63,7 +61,6 @@ def start_keep_alive():
     if not url:
         logger.warning("⚠️ KOYEB_APP_URL не задан, keep-alive отключён")
         return
-
     def ping_loop():
         while True:
             try:
@@ -72,14 +69,12 @@ def start_keep_alive():
             except Exception as e:
                 logger.warning(f"[keep-alive] Ошибка: {e}")
             time.sleep(240)
-
-    proc = multiprocessing.Process(target=ping_loop, daemon=True)
-    proc.start()
+    threading.Thread(target=ping_loop, daemon=True).start()
     logger.info(f"🩵 Keep-alive активирован (ping → {url})")
 
 
 # ============================================================
-# TOKEN
+# 🔑 TOKEN
 # ============================================================
 
 TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
@@ -91,7 +86,7 @@ else:
 
 
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ
+# 🕒 ВСПОМОГАТЕЛЬНЫЕ
 # ============================================================
 
 def format_duration(seconds: float) -> str:
@@ -116,11 +111,11 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
     request_stop()
-    await update.message.reply_text("📨 Получен сигнал на остановку, завершение в ближайшие секунды...")
+    await update.message.reply_text("📨 Получен сигнал на остановку. Завершение расчёта...")
 
 
 # ============================================================
-# СТАРТ
+# /start
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,55 +129,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# ОСНОВНАЯ ЛОГИКА (запускается в отдельном процессе)
+# 🔁 ПРОГРЕСС-МОНТОР
 # ============================================================
 
-def run_generation(data, document_path, chat_id, username, timestamp):
-    """Запускается в отдельном процессе, чтобы не блокировать Telegram"""
+def progress_notifier(context, chat_id, stop_flag):
+    """Отправляет напоминание каждые 60 секунд, пока идёт генерация"""
+    logger.info(f"🔔 Запущен прогресс-монитор для chat_id={chat_id}")
+    while not stop_flag.is_set():
+        time.sleep(60)
+        if stop_flag.is_set():
+            break
+        try:
+            context.application.create_task(
+                context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить статусное сообщение: {e}")
+    logger.info(f"🛑 Прогресс-монитор остановлен для chat_id={chat_id}")
+
+
+# ============================================================
+# 🧩 ОСНОВНАЯ ЛОГИКА ГЕНЕРАЦИИ
+# ============================================================
+
+def run_generation(data, document, user_id, username, timestamp, context):
+    """Запускается в отдельном потоке, чтобы не блокировать Telegram"""
     try:
         start_time = time.time()
-        variants, stats = generate_program_variants(data, chat_id=chat_id)
+
+        # Флаг для уведомлений
+        stop_flag = threading.Event()
+        monitor_thread = threading.Thread(
+            target=progress_notifier, args=(context, user_id, stop_flag), daemon=True
+        )
+        monitor_thread.start()
+
+        # Основная генерация
+        variants, stats = generate_program_variants(data, chat_id=user_id)
+        stop_flag.set()  # остановить монитор после завершения
+
         elapsed = time.time() - start_time
         readable_time = format_duration(elapsed)
 
-        if not variants:
-            send_message(chat_id, "❌ Вариантов программы не нашлось. Попробуйте еще раз!")
-            return
+        async def send_final():
+            if not variants:
+                await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте еще раз!")
+                return
 
-        result = variants[0]
-        result_json_path = Path(f"data/result_{timestamp}_{chat_id}.json")
-        with open(result_json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+            result = variants[0]
+            result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
+            with open(result_json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
 
-        out_path = Path(f"data/output_{timestamp}_{chat_id}.docx")
-        save_program_to_docx(result, out_path, original_filename=document_path.name)
+            out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
+            save_program_to_docx(result, out_path, original_filename=document.file_name)
 
-        tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+            tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+            msg = (
+                f"🎬 Программа собрана!\n"
+                f"🕓 Время: {readable_time}\n"
+                f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
+                f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
+                f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
+                f"Добавлено тянучек: {stats.get('tyanuchки_added', 0)}"
+            )
+            if tyan_titles:
+                msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+            else:
+                msg += "\n\n✅ Без тянучек!"
 
-        msg = (
-            f"🎬 Программа собрана!\n"
-            f"🕓 Время: {readable_time}\n"
-            f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
-            f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
-            f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
-            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
-        )
-        if tyan_titles:
-            msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
-        else:
-            msg += "\n\n✅ Без тянучек!"
+            await context.bot.send_message(user_id, f"✅ Готово! Время: {readable_time}")
+            await context.bot.send_document(user_id, open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
+            await context.bot.send_document(user_id, open(out_path, "rb"), caption=msg)
 
-        send_message(chat_id, f"✅ Готово! Время: {readable_time}")
-        send_message(chat_id, msg)
+        context.application.create_task(send_final())
         logger.info(f"✅ Завершено для @{username} за {readable_time}")
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        send_message(chat_id, f"❌ Ошибка при обработке файла: {e}")
+        context.application.create_task(
+            context.bot.send_message(user_id, f"❌ Ошибка при обработке файла: {e}")
+        )
 
 
 # ============================================================
-# ОБРАБОТКА ФАЙЛОВ
+# 📁 ОБРАБОТКА ДОКУМЕНТОВ
 # ============================================================
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,18 +237,17 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
     await update.message.reply_text("📊 Начинаю генерацию программы... (можно остановить командой /stop)")
 
-    # 🧩 Запуск отдельного процесса для расчёта
-    proc = multiprocessing.Process(
+    thread = threading.Thread(
         target=run_generation,
-        args=(data, local_path, user.id, username, timestamp),
+        args=(data, document, user.id, username, timestamp, context),
         daemon=True,
     )
-    proc.start()
-    logger.info(f"🚀 Процесс генерации запущен (pid={proc.pid}) для @{username}")
+    thread.start()
+    logger.info(f"🚀 Поток генерации запущен (tid={thread.ident}) для @{username}")
 
 
 # ============================================================
-# MAIN
+# 🚀 MAIN
 # ============================================================
 
 def main():

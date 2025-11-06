@@ -147,7 +147,7 @@ def _has_gk_violation(program):
 # ============================================================
 
 def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
-    from utils.validator import STOP_FLAG  # предотвращаем циклы импорта
+    from utils.validator import STOP_FLAG
     n = len(program)
     fixed, movable = _compute_fixed_indices(program)
     movables = [program[i] for i in movable]
@@ -160,11 +160,12 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
 
     best, checked, best_conf = [], 0, float("inf")
     found_zero = False
+    iteration = 0  # для отладки
 
     def backtrack(pos, confs):
-        nonlocal checked, best_conf, found_zero
-        if STOP_FLAG:  # 🛑 Пользователь вызвал /stop
-            logger.info("🚫 Остановка поиска по команде /stop")
+        nonlocal checked, best_conf, found_zero, iteration
+        if STOP_FLAG:
+            logger.info("🧩 STOP_FLAG активен — прерываю расчёт")
             return
         if confs > max_conflicts_allowed or found_zero:
             return
@@ -172,6 +173,9 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
             pos += 1
         if pos >= n:
             checked += 1
+            iteration += 1
+            if iteration % 50 == 0:
+                logger.debug(f"🔍 Проверено {checked} вариантов...")
             if _has_kv_violation(current) or _has_gk_violation(current):
                 return
             if confs <= best_conf:
@@ -182,11 +186,13 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
             if confs == 0:
                 found_zero = True
             return
+
         left = current[pos - 1] if pos > 0 else None
         choices = [i for i, u in enumerate(used) if not u]
         random.shuffle(choices)
         for i in choices:
             if STOP_FLAG:
+                logger.info("🧩 STOP_FLAG сработал во время итерации — выходим")
                 return
             el = movables[i]
             if left and _adjacency_forbidden(left, el):
@@ -206,6 +212,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
                 return
 
     backtrack(0, 0)
+    logger.info(f"🔎 Завершён перебор: проверено {checked} вариантов, лучший конфликт={best_conf}")
     return best[:max_results], checked
 
 
@@ -339,7 +346,7 @@ def generate_program_variants(program, chat_id=None, top_n=5):
             "checked_variants": checked,
             "initial_conflicts": best_conf,
             "final_conflicts": None,
-            "tyanuchki_added": added,
+            "tyanuchки_added": added,
         }
 
     final_conf = _count_conflicts(prog)
@@ -349,5 +356,5 @@ def generate_program_variants(program, chat_id=None, top_n=5):
         "checked_variants": checked,
         "initial_conflicts": best_conf,
         "final_conflicts": final_conf,
-        "tyanuchki_added": added,
+        "tyanuchки_added": added,
     }
