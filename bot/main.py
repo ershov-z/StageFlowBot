@@ -2,6 +2,11 @@ import asyncio
 import logging
 import os
 from io import BytesIO
+from pathlib import Path
+import threading
+import requests
+from flask import Flask
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
@@ -9,14 +14,17 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
-from bot import file_manager
+from bot import file_manager, responses
+from core.parser import parse_docx
+from core.optimizer import stochastic_branch_and_bound
+from core.validator import validate_arrangement
+from service.seeds import generate_seeds
 
 # === Инициализация бота ===
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ BOT_TOKEN not found in environment variables")
 
-# Новая форма инициализации (Aiogram ≥ 3.7.0)
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -26,57 +34,105 @@ dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# === Flask healthcheck ===
+app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
+def start_flask():
+    """Запускает Flask сервер в отдельном потоке."""
+    port = int(os.getenv("PORT", 8080))
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
+        daemon=True
+    ).start()
+    logger.info(f"🌐 Flask healthcheck сервер запущен на порту {port}")
+
+
+# === Авто-пинг приложения каждые 2 минуты ===
+async def self_ping_loop():
+    app_url = os.getenv("APP_URL")
+    if not app_url:
+        logger.warning("⚠️ APP_URL не задан, пинг отключён.")
+        return
+    while True:
+        try:
+            requests.get(app_url + "/health", timeout=10)
+            logger.info("🔁 Self-ping → /health OK")
+        except Exception as e:
+            logger.warning(f"⚠️ Self-ping error: {e}")
+        await asyncio.sleep(120)  # каждые 2 минуты
+
 
 # === Обработчики ===
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
-    await message.answer(
-        "👋 Привет! Отправь мне .docx файл с программой концерта, "
-        "и я подготовлю пять вариантов перестройки."
-    )
+    await message.answer(responses.start_message())
 
 
 @dp.message(Command(commands=["help"]))
 async def help_command(message: types.Message):
-    await message.answer(
-        "📘 Отправь .docx файл, содержащий таблицу концертной программы.\n"
-        "Бот создаст 5 идеальных вариантов перестройки и вернёт архив ZIP."
-    )
+    await message.answer(responses.help_message())
 
 
 @dp.message(lambda msg: msg.document and msg.document.file_name.endswith(".docx"))
 async def handle_docx(message: types.Message):
     document = message.document
     file_name = document.file_name
-    logger.info(f"Получен файл: {file_name}")
+    logger.info(f"📄 Получен файл: {file_name}")
+    await message.answer(responses.processing_message())
 
     try:
         # === 1. Скачиваем файл ===
         file_path = await file_manager.download_docx(bot, document)
-        logger.info(f"Файл сохранён: {file_path}")
+        logger.info(f"✅ Файл сохранён: {file_path}")
 
-        # === 2. Генерируем варианты ===
-        # Пока можно оставить заглушку, чтобы проверить отправку
-        zip_buffer = BytesIO(b"Test ZIP")
-        logger.info("ZIP с вариантами создан (тестовая заглушка)")
+        # === 2. Парсим документ ===
+        program = parse_docx(file_path)
+        blocks = program.blocks
+        logger.info(f"📊 Извлечено блоков: {len(blocks)}")
 
-        # === 3. Отправляем пользователю ===
-        zip_bytes = zip_buffer.getvalue()
-        result_file = BufferedInputFile(zip_bytes, filename="variants.zip")
-        await message.answer_document(result_file, caption="🎯 Вот 5 идеальных вариантов программы")
+        # === 3. Генерируем варианты ===
+        seeds = generate_seeds(5)
+        arrangements = []
+        for seed in seeds:
+            arranged = await stochastic_branch_and_bound(blocks, seed)
+            if validate_arrangement(arranged):
+                arrangements.append(
+                    type("Arrangement", (), {"blocks": arranged, "seed": seed})
+                )
+
+        if not arrangements:
+            await message.answer(responses.validation_failed_message())
+            return
+
+        # === 4. Экспортируем ===
+        template_path = Path(file_path)
+        zip_buffer = await file_manager.export_variants(arrangements, template_path)
+
+        # === 5. Отправляем ===
+        result_file = BufferedInputFile(zip_buffer.getvalue(), filename="StageFlow_Results.zip")
+        await message.answer_document(result_file, caption=responses.success_message())
 
     except Exception as e:
-        logger.exception("Ошибка при обработке файла")
-        await message.answer(f"❌ Произошла ошибка: {e}")
+        logger.exception("❌ Ошибка при обработке файла")
+        await message.answer(responses.internal_error_message())
+        await message.answer(f"<code>{e}</code>")
 
 
 @dp.message()
 async def fallback(message: types.Message):
-    await message.answer("Отправь мне .docx файл, чтобы я создал варианты программы.")
+    await message.answer(responses.unknown_message())
 
 
-# === Точка входа ===
+# === Главная точка входа ===
 async def main():
+    logger.info("🤖 StageFlow Bot запущен.")
+    start_flask()  # запускаем healthcheck-сервер
+    asyncio.create_task(self_ping_loop())  # запускаем авто-пинг
     await dp.start_polling(bot)
 
 
