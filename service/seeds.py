@@ -20,3 +20,9 @@ def generate_unique_seeds(n: int = 5) -> list[int]:
     result = sorted(list(seeds))
     log.info(f"🌱 Сгенерированы seed’ы: {result}")
     return result
+
+
+# ✅ алиас для совместимости с main.py
+def generate_seeds(n: int = 5) -> list[int]:
+    """Совместимый алиас, используется ботом (main.py)."""
+    return generate_unique_seeds(n)
