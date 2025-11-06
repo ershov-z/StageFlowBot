@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Literal, Optional
 
 
 # ============================================================
@@ -20,7 +20,6 @@ class Actor:
     tags: List[str] = field(default_factory=list)
 
     def __hash__(self):
-        # Позволяет использовать Actor в set() и dict()
         return hash(self.name.lower())
 
     def has_tag(self, tag: str) -> bool:
@@ -34,19 +33,15 @@ class Actor:
 @dataclass
 class Block:
     """
-    Один номер программы концерта.
-    index        — порядковый номер;
-    pp           — строка из колонки "ПП";
-    actors       — список актёров;
-    description  — описание / название номера;
-    type         — тип блока:
-        "обычный", "предкулисье", "спонсоры", "тянучка".
+    Один элемент программы (номер, тянучка, предкулисье, спонсор).
     """
-    index: int
-    pp: str
+    id: int
+    name: str = ""
+    type: Literal["performance", "filler", "sponsor", "prelude"] = "performance"
     actors: List[Actor] = field(default_factory=list)
-    description: str = ""
-    type: str = "обычный"
+    kv: bool = False
+    fixed: bool = False
+    meta: Optional[dict] = None
 
     def actor_names(self) -> List[str]:
         """Возвращает список имён актёров (без дубликатов)."""
@@ -73,7 +68,7 @@ class Program:
         indices = []
         for block in self.blocks:
             if block.has_actor(name):
-                indices.append(block.index)
+                indices.append(block.id)
         return indices
 
     def __len__(self):
@@ -81,3 +76,40 @@ class Program:
 
     def __iter__(self):
         return iter(self.blocks)
+
+
+# ============================================================
+# 🧩 Результирующая перестановка
+# ============================================================
+
+@dataclass
+class Arrangement:
+    """Готовая перестроенная программа."""
+    blocks: List[Block]
+    seed: int
+    score: float = 0.0
+    fillers_count: int = 0
+    strong_conflicts: int = 0
+    weak_conflicts: int = 0
+
+
+# ============================================================
+# ⚔️ Конфликт и тянучки
+# ============================================================
+
+@dataclass
+class Conflict:
+    """Описание конфликта между двумя блоками."""
+    index_a: int
+    index_b: int
+    type: Literal["weak", "strong"]
+    reason: str
+
+
+@dataclass
+class FillerCandidate:
+    """Кандидат на тянучку между двумя номерами."""
+    prev_block: Block
+    next_block: Block
+    actor_name: str
+    valid: bool
