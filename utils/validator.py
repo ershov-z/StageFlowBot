@@ -6,25 +6,24 @@
 import copy
 import random
 import time
+import threading
 from loguru import logger
 from utils.telegram_utils import send_message
 
 # ============================================================
-# 🛑 Глобальный STOP-флаг
+# 🛑 Глобальный STOP-событие (читабельно из любой глубины рекурсии)
 # ============================================================
 
-STOP_FLAG = False
+STOP_EVENT = threading.Event()
 
 def request_stop():
     """Запрашивает остановку текущего перебора"""
-    global STOP_FLAG
-    STOP_FLAG = True
+    STOP_EVENT.set()
     logger.warning("🛑 Получен запрос на остановку расчёта пользователем.")
 
 def reset_stop():
-    """Сбрасывает флаг остановки перед новым запуском"""
-    global STOP_FLAG
-    STOP_FLAG = False
+    """Сбрасывает остановку перед новым запуском"""
+    STOP_EVENT.clear()
 
 
 # ============================================================
@@ -149,8 +148,9 @@ def _has_gk_violation(program):
 SLEEP_INTERVAL = 200
 SLEEP_TIME = 0.02
 
-def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_id=None):
+def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_id=None, stop_event: threading.Event = None):
     """Основной бэктрекинг-перебор с мгновенной остановкой и throttling"""
+    stop_event = stop_event or STOP_EVENT  # по умолчанию используем глобальное событие
     n = len(program)
     fixed, movable = _compute_fixed_indices(program)
     movables = [program[i] for i in movable]
@@ -170,9 +170,8 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
     # ------------------------------------------------------------
     def backtrack(pos, confs):
         nonlocal checked, best_conf, iteration, notified_start
-        global STOP_FLAG  # 🔹 Ключевой фикс: теперь читается актуальное значение STOP_FLAG
 
-        if STOP_FLAG:
+        if stop_event.is_set():
             raise StopComputation
 
         if confs > max_conflicts_allowed:
@@ -183,7 +182,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
             time.sleep(SLEEP_TIME)
 
         while pos < n and current[pos] is not None:
-            if STOP_FLAG:
+            if stop_event.is_set():
                 raise StopComputation
             pos += 1
 
@@ -204,8 +203,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
 
         left = current[pos - 1] if pos > 0 else None
         for i in range(len(movables)):
-            global STOP_FLAG  # 🔹 Вложенная проверка — важно для рекурсивных ветвей
-            if STOP_FLAG:
+            if stop_event.is_set():
                 raise StopComputation
             if used[i]:
                 continue
@@ -221,6 +219,8 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
             backtrack(pos + 1, newc)
             used[i] = False
             current[pos] = None
+            if stop_event.is_set():
+                raise StopComputation
 
         iteration += 1
     # ------------------------------------------------------------
@@ -236,7 +236,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
     try:
         backtrack(0, 0)
     except StopComputation:
-        logger.warning("🚫 Перебор прерван по STOP_FLAG (команда /stop)")
+        logger.warning("🚫 Перебор прерван по STOP (команда /stop)")
         if chat_id:
             try:
                 send_message(chat_id, "🚫 Расчёт остановлен. Отправляю лучший найденный вариант…")
@@ -321,7 +321,8 @@ def generate_program_variants(program, chat_id=None, top_n=5):
             "tyanuchki_added": 0,
         }
 
-    best, checked = _search_best_variants(program, chat_id=chat_id)
+    # ⚠️ Ключевой момент: передаём ссылку на событие остановки
+    best, checked = _search_best_variants(program, chat_id=chat_id, stop_event=STOP_EVENT)
 
     if not best:
         base = _count_conflicts(program)
@@ -339,7 +340,7 @@ def generate_program_variants(program, chat_id=None, top_n=5):
     logger.success(f"🎯 Конфликтов {best_conf} → 0 после добавления {added} тянучек")
     return [prog], {
         "checked_variants": checked,
-        "initial_conflicts": best_conf,
-        "final_conflicts": 0,
+        "initial_conflicts": best_conf,  # слабые конфликты ДО тянучек
+        "final_conflicts": 0,            # финально конфликтов нет
         "tyanuchki_added": added,
     }

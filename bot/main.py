@@ -76,7 +76,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
     request_stop()
-    await update.message.reply_text("📨 Получен сигнал на остановку. Завершение расчёта...")
+    await update.message.reply_text("📨 Получен сигнал на остановку. Расчёт будет завершён — ожидайте итоговый вариант...")
 
 # ------------------------------------------------------------
 # START
@@ -94,13 +94,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------
 def progress_notifier(context, chat_id, stop_flag):
     logger.info(f"🔔 Прогресс-монитор для chat_id={chat_id}")
+    loop = context.application.loop
     while not stop_flag.is_set():
         time.sleep(60)
         if stop_flag.is_set():
             break
         try:
-            context.application.create_task(
-                context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
+            # безопасно отправляем из другого потока
+            loop.call_soon_threadsafe(
+                lambda: context.application.create_task(
+                    context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
+                )
             )
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить статус: {e}")
@@ -124,15 +128,14 @@ def run_generation(data, document, user_id, username, timestamp, context):
 
         async def send_final():
             if not variants:
-                logger.warning(f"❌ Вариантов не найдено для @{username}")
                 await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
                 return
-
             result = variants[0]
+
             result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
             with open(result_json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
-            logger.info(f"📤 JSON с финальным результатом сохранён: {result_json_path}")
+            logger.info(f"📤 JSON с результатом сохранён: {result_json_path}")
 
             out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
             out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
