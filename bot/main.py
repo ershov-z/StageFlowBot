@@ -82,6 +82,8 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # START
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    logger.info(f"👋 Пользователь @{user.username} запустил бота.")
     await update.message.reply_text(
         "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую и переставлю номера.\n\n"
         "🛑 Командой /stop можно прервать процесс и получить лучший найденный вариант."
@@ -122,19 +124,20 @@ def run_generation(data, document, user_id, username, timestamp, context):
 
         async def send_final():
             if not variants:
+                logger.warning(f"❌ Вариантов не найдено для @{username}")
                 await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
                 return
-            result = variants[0]
 
+            result = variants[0]
             result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
             with open(result_json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
+            logger.info(f"📤 JSON с финальным результатом сохранён: {result_json_path}")
 
             out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
-            # 🔧 Используем возвращаемый путь из save_program_to_docx()
             out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
+            logger.info(f"📄 DOCX сгенерирован: {out_path}")
 
-            # 🔹 Корректное отображение конфликтов
             final_conf = stats.get('final_conflicts', 0) or 0
             msg = (
                 f"🎬 Программа собрана!\n"
@@ -154,6 +157,7 @@ def run_generation(data, document, user_id, username, timestamp, context):
             await context.bot.send_message(user_id, f"✅ Готово! Время: {elapsed}")
             await context.bot.send_document(open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
             await context.bot.send_document(open(out_path, "rb"), caption=msg)
+            logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
         context.application.create_task(send_final())
 
@@ -168,14 +172,18 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or "unknown"
     document = update.message.document
-    if not document.file_name.lower().endswith(".docx"):
-        return await update.message.reply_text("⚠️ Отправь файл в формате .docx.")
 
-    logger.info(f"📄 Получен файл {document.file_name} от @{username}")
+    logger.info(f"📥 Получен файл {document.file_name} от @{username}")
+    if not document.file_name.lower().endswith(".docx"):
+        await update.message.reply_text("⚠️ Отправь файл в формате .docx.")
+        logger.warning(f"⚠️ @{username} отправил неподдерживаемый файл: {document.file_name}")
+        return
+
     file = await document.get_file()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_path = Path(f"data/{timestamp}__{document.file_name}")
     await file.download_to_drive(local_path)
+    logger.info(f"📂 Файл сохранён локально: {local_path}")
 
     data = read_program(local_path)
     parsed_json_path = Path(f"data/parsed_{timestamp}_{user.id}.json")
@@ -183,8 +191,8 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
+    logger.info(f"📄 Распарсенный JSON отправлен пользователю @{username}: {parsed_json_path}")
 
-    # 🔹 Расчёт количества перестановок
     movable = [i for i, x in enumerate(data)
                if x.get("type") == "обычный" and 2 < i < len(data) - 2]
     count = len(movable)
@@ -197,7 +205,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛑 Можно остановить командой /stop"
     )
     await update.message.reply_text(msg)
-    logger.info(f"📊 Будет просчитано {count}! вариантов (ограничено по факториалу).")
+    logger.info(f"📊 Начинается расчёт {count}! вариантов для @{username}")
 
     thread = threading.Thread(
         target=run_generation,
@@ -212,11 +220,13 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
-    start_health_server(); start_keep_alive()
+    start_health_server()
+    start_keep_alive()
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
+    logger.info("✅ Хэндлеры загружены. Бот готов к приёму документов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
