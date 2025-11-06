@@ -119,6 +119,19 @@ async def handle_docx(message: types.Message):
             )
         logger.info(f"💾 Сохранён parsed.json: {parsed_path}")
 
+        # 📤 Отправляем parsed.json пользователю
+        try:
+            with open(parsed_path, "rb") as f:
+                json_bytes = f.read()
+            json_file = BufferedInputFile(json_bytes, filename="parsed.json")
+            await message.answer_document(
+                json_file,
+                caption="📄 Вот как я распознал программу из твоего файла."
+            )
+            logger.info("📤 parsed.json отправлен пользователю.")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить parsed.json: {e}")
+
         # === 3. Генерируем варианты ===
         seeds = generate_seeds(5)
         arrangements = []
@@ -138,11 +151,9 @@ async def handle_docx(message: types.Message):
         zip_buffer = await file_manager.export_variants(arrangements, template_path)
 
         # === 5. Добавляем parsed.json в архив ===
-        # (чтобы пользователь видел исходные данные)
         with open(parsed_path, "rb") as f:
             parsed_bytes = f.read()
 
-        # Пересобираем ZIP с parsed.json
         final_zip = BytesIO()
         import zipfile
         zip_buffer.seek(0)
@@ -152,7 +163,7 @@ async def handle_docx(message: types.Message):
             dst_zip.writestr("parsed.json", parsed_bytes)
         final_zip.seek(0)
 
-        # === 6. Отправляем ===
+        # === 6. Отправляем архив ===
         result_file = BufferedInputFile(final_zip.getvalue(), filename="StageFlow_Results.zip")
         await message.answer_document(result_file, caption=responses.success_message())
 
