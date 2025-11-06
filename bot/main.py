@@ -125,9 +125,10 @@ async def handle_docx(message: types.Message):
                 json_bytes = f.read()
             json_file = BufferedInputFile(json_bytes, filename="parsed.json")
             await message.answer_document(
-                json_file,
+                document=json_file,
                 caption="📄 Вот как я распознал программу из твоего файла."
             )
+            await asyncio.sleep(1)  # ждём отправку
             logger.info("📤 parsed.json отправлен пользователю.")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить parsed.json: {e}")
@@ -165,7 +166,7 @@ async def handle_docx(message: types.Message):
 
         # === 6. Отправляем архив ===
         result_file = BufferedInputFile(final_zip.getvalue(), filename="StageFlow_Results.zip")
-        await message.answer_document(result_file, caption=responses.success_message())
+        await message.answer_document(document=result_file, caption=responses.success_message())
 
     except Exception as e:
         logger.exception("❌ Ошибка при обработке файла")
