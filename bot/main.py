@@ -6,6 +6,7 @@ import json
 import math
 import time
 import threading
+import requests  # 🩵 KEEP-ALIVE FIX for Koyeb
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -54,6 +55,31 @@ def start_health_server():
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
+
+
+# ============================================================
+# 🩵 KEEP-ALIVE FIX for Koyeb
+# ============================================================
+
+def start_keep_alive():
+    """Периодически пингует Koyeb-приложение, чтобы оно не засыпало"""
+    url = os.getenv("KOYEB_APP_URL")
+    if not url:
+        logger.warning("⚠️ Переменная KOYEB_APP_URL не задана, keep-alive отключён")
+        return
+
+    def ping_loop():
+        while True:
+            try:
+                requests.get(url)
+                logger.debug(f"[keep-alive] Пинг {url} успешен")
+            except Exception as e:
+                logger.warning(f"[keep-alive] Ошибка: {e}")
+            time.sleep(240)  # каждые 4 минуты
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
+    logger.info(f"🩵 Keep-alive активирован (ping → {url})")
 
 
 # ============================================================
@@ -204,6 +230,7 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
     start_health_server()
+    start_keep_alive()  # 🩵 активируем keep-alive
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -214,6 +241,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # ✅ Гарантируем корректный импорт при запуске напрямую
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     main()
