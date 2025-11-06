@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import json
+import uuid
+import tempfile
 from io import BytesIO
 from pathlib import Path
 import threading
@@ -32,7 +35,7 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("stageflow.main")
 
 # === Flask healthcheck ===
 app = Flask(__name__)
@@ -64,7 +67,7 @@ async def self_ping_loop():
             logger.info("🔁 Self-ping → /health OK")
         except Exception as e:
             logger.warning(f"⚠️ Self-ping error: {e}")
-        await asyncio.sleep(120)  # каждые 2 минуты
+        await asyncio.sleep(120)
 
 
 # === Обработчики ===
@@ -95,6 +98,27 @@ async def handle_docx(message: types.Message):
         blocks = program.blocks
         logger.info(f"📊 Извлечено блоков: {len(blocks)}")
 
+        # 💾 Сохраняем parsed.json
+        parsed_path = Path(tempfile.gettempdir()) / f"parsed_{uuid.uuid4().hex[:6]}.json"
+        with open(parsed_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {
+                        "id": b.id,
+                        "name": b.name,
+                        "type": b.type,
+                        "kv": b.kv,
+                        "fixed": b.fixed,
+                        "actors": [{"name": a.name, "tags": a.tags} for a in b.actors],
+                    }
+                    for b in blocks
+                ],
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        logger.info(f"💾 Сохранён parsed.json: {parsed_path}")
+
         # === 3. Генерируем варианты ===
         seeds = generate_seeds(5)
         arrangements = []
@@ -113,8 +137,23 @@ async def handle_docx(message: types.Message):
         template_path = Path(file_path)
         zip_buffer = await file_manager.export_variants(arrangements, template_path)
 
-        # === 5. Отправляем ===
-        result_file = BufferedInputFile(zip_buffer.getvalue(), filename="StageFlow_Results.zip")
+        # === 5. Добавляем parsed.json в архив ===
+        # (чтобы пользователь видел исходные данные)
+        with open(parsed_path, "rb") as f:
+            parsed_bytes = f.read()
+
+        # Пересобираем ZIP с parsed.json
+        final_zip = BytesIO()
+        import zipfile
+        zip_buffer.seek(0)
+        with zipfile.ZipFile(zip_buffer, "r") as src_zip, zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED) as dst_zip:
+            for item in src_zip.infolist():
+                dst_zip.writestr(item, src_zip.read(item.filename))
+            dst_zip.writestr("parsed.json", parsed_bytes)
+        final_zip.seek(0)
+
+        # === 6. Отправляем ===
+        result_file = BufferedInputFile(final_zip.getvalue(), filename="StageFlow_Results.zip")
         await message.answer_document(result_file, caption=responses.success_message())
 
     except Exception as e:
@@ -131,8 +170,8 @@ async def fallback(message: types.Message):
 # === Главная точка входа ===
 async def main():
     logger.info("🤖 StageFlow Bot запущен.")
-    start_flask()  # запускаем healthcheck-сервер
-    asyncio.create_task(self_ping_loop())  # запускаем авто-пинг
+    start_flask()
+    asyncio.create_task(self_ping_loop())
     await dp.start_polling(bot)
 
 

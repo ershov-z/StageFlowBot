@@ -6,12 +6,12 @@ import tempfile
 import logging
 import zipfile
 import asyncio
+import time
 from pathlib import Path
 from aiogram import Bot
 from aiogram.types import Document
 from aiofiles import open as aio_open
 
-# Импортируем экспортер
 from core.exporter import export_all
 from service.logger import get_logger
 
@@ -38,10 +38,7 @@ async def ensure_dirs() -> None:
 # 📥 Загрузка .docx
 # ----------------------------------------------------
 async def download_docx(bot: Bot, document: Document) -> str:
-    """
-    Скачивает docx-файл, присланный пользователем, во временную директорию.
-    Возвращает путь к локальному файлу.
-    """
+    """Скачивает docx-файл, присланный пользователем, во временную директорию."""
     await ensure_dirs()
     file_info = await bot.get_file(document.file_id)
 
@@ -50,8 +47,9 @@ async def download_docx(bot: Bot, document: Document) -> str:
 
     try:
         file_data = await bot.download_file(file_info.file_path)
+        data = file_data.read()
         async with aio_open(local_path, "wb") as f:
-            await f.write(file_data.read())
+            await f.write(data)
         log.info(f"📂 Файл сохранён: {local_path}")
         return local_path
     except Exception as e:
@@ -65,7 +63,7 @@ async def download_docx(bot: Bot, document: Document) -> str:
 async def cleanup_old_files(hours: int = 2) -> None:
     """Удаляет временные файлы старше указанного количества часов."""
     await ensure_dirs()
-    cutoff = asyncio.get_event_loop().time() - hours * 3600
+    cutoff = time.time() - hours * 3600
 
     for folder in (DOWNLOAD_DIR, RESULTS_DIR):
         for filename in os.listdir(folder):
@@ -83,13 +81,7 @@ async def cleanup_old_files(hours: int = 2) -> None:
 # 🧩 Экспорт и упаковка вариантов
 # ----------------------------------------------------
 async def export_variants(arrangements, template_path: Path) -> io.BytesIO:
-    """
-    Экспортирует 5 вариантов программы и возвращает ZIP-буфер.
-
-    :param arrangements: список из 5 Arrangement
-    :param template_path: путь к шаблону таблицы docx
-    :return: BytesIO — архив для отправки пользователю
-    """
+    """Экспортирует 5 вариантов программы и возвращает ZIP-буфер."""
     await ensure_dirs()
 
     try:
@@ -98,13 +90,13 @@ async def export_variants(arrangements, template_path: Path) -> io.BytesIO:
 
         log.info(f"🧾 Начало экспорта пяти вариантов → {export_dir}")
 
-        # Экспорт всех вариантов и упаковка в ZIP
-        zip_path = export_all(arrangements, Path(template_path), export_dir)
+        zip_path = export_all(arrangements, template_path, export_dir)
 
         # Читаем ZIP в память для отправки
         with open(zip_path, "rb") as f:
             buffer = io.BytesIO(f.read())
         buffer.seek(0)
+        os.remove(zip_path)  # очистка после упаковки
 
         log.info(f"📦 Готов ZIP для отправки: {zip_path}")
         return buffer

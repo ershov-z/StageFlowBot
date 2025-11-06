@@ -6,6 +6,7 @@ from docx.oxml.ns import nsdecls, qn
 from pathlib import Path
 from typing import List
 import zipfile
+import json
 
 from .types import Block, Arrangement
 from service.logger import get_logger
@@ -13,6 +14,9 @@ from service.logger import get_logger
 logger = get_logger(__name__)
 
 
+# ============================================================
+# 📦 Экспорт одного варианта
+# ============================================================
 def export_arrangement(arrangement: Arrangement, template_path: Path, output_path: Path) -> Path:
     """
     Преобразует Arrangement (список блоков) в .docx таблицу на основе шаблона.
@@ -21,8 +25,8 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
     1. № (только для выступлений)
     2. Актёры
     3. ПП
-    4. Найм (пустая)
-    5. Ответственный (пустая)
+    4. Найм
+    5. Ответственный
     6. kv
     """
     logger.info(f"[EXPORT] Начат экспорт seed={arrangement.seed}")
@@ -40,33 +44,58 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
 
-    logger.info(f"[EXPORT] Успешно сохранён: {output_path}")
+    logger.info(f"[EXPORT] Успешно сохранён DOCX: {output_path}")
     return output_path
 
 
+# ============================================================
+# 📦 Экспорт всех 5 вариантов + JSON
+# ============================================================
 def export_all(arrangements: List[Arrangement], template_path: Path, export_dir: Path) -> Path:
     """
-    Экспортирует пять вариантов программы в .docx и упаковывает их в ZIP.
+    Экспортирует все варианты программы (DOCX + JSON) и упаковывает их в ZIP.
 
-    :param arrangements: список из 5 Arrangement
+    :param arrangements: список Arrangement
     :param template_path: шаблон docx таблицы
     :param export_dir: директория для вывода
     :return: путь к zip архиву
     """
-    logger.info("[EXPORT_ALL] Начинается пакетный экспорт пяти вариантов")
+    logger.info("[EXPORT_ALL] Начинается пакетный экспорт всех вариантов")
 
     export_dir.mkdir(parents=True, exist_ok=True)
-    docx_paths = []
+    exported_files = []
 
     for i, arrangement in enumerate(arrangements, start=1):
-        output_file = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.docx"
-        export_arrangement(arrangement, template_path, output_file)
-        docx_paths.append(output_file)
+        # --- Файлы для конкретного варианта ---
+        output_docx = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.docx"
+        output_json = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.json"
 
-    # Создаём архив
+        # --- Экспорт таблицы ---
+        export_arrangement(arrangement, template_path, output_docx)
+
+        # --- Экспорт JSON ---
+        json_data = [
+            {
+                "id": b.id,
+                "name": b.name,
+                "type": b.type,
+                "kv": b.kv,
+                "fixed": b.fixed,
+                "actors": [{"name": a.name, "tags": a.tags} for a in b.actors],
+            }
+            for b in arrangement.blocks
+        ]
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"[EXPORT_ALL] Сохранён JSON: {output_json}")
+
+        exported_files.extend([output_docx, output_json])
+
+    # --- Создание ZIP ---
     zip_path = export_dir / "StageFlow_Results.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for path in docx_paths:
+        for path in exported_files:
             zipf.write(path, arcname=path.name)
             logger.info(f"[EXPORT_ALL] Добавлен в архив: {path.name}")
 
@@ -74,10 +103,11 @@ def export_all(arrangements: List[Arrangement], template_path: Path, export_dir:
     return zip_path
 
 
+# ============================================================
+# 🧩 Добавление строк в таблицу
+# ============================================================
 def _append_block_row(table, block: Block, index: int):
-    """
-    Добавляет строку для блока (выступление, филлер, предкулисье, спонсор).
-    """
+    """Добавляет строку для блока (выступление, филлер, предкулисье, спонсор)."""
     row = table.add_row()
     cells = row.cells
 
@@ -104,10 +134,11 @@ def _append_block_row(table, block: Block, index: int):
     _apply_block_style(row, block)
 
 
+# ============================================================
+# 🎨 Оформление строк
+# ============================================================
 def _apply_block_style(row, block: Block):
-    """
-    Применяет визуальное оформление для особых типов блоков.
-    """
+    """Применяет визуальное оформление для особых типов блоков."""
     for cell in row.cells:
         for paragraph in cell.paragraphs:
             run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
@@ -130,17 +161,13 @@ def _apply_block_style(row, block: Block):
 
 
 def _prefix_label(row, label: str):
-    """
-    Добавляет текстовую метку в начало второй колонки (актёры).
-    """
+    """Добавляет текстовую метку в начало второй колонки (актёры)."""
     cell = row.cells[1]
     cell.text = f"{label} {cell.text.strip()}"
 
 
 def _set_row_shading(row, color_hex: str):
-    """
-    Устанавливает цвет фона для всей строки.
-    """
+    """Устанавливает цвет фона для всей строки."""
     for cell in row.cells:
         cell._element.get_or_add_tcPr().append(_shading_xml(color_hex))
 
