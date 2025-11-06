@@ -14,7 +14,6 @@ def measure_time(label: str = None):
     """
     def decorator(func):
         if asyncio.iscoroutinefunction(func):
-            import asyncio
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
@@ -27,6 +26,7 @@ def measure_time(label: str = None):
                 return result
 
             return async_wrapper
+
         else:
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
@@ -39,4 +39,5 @@ def measure_time(label: str = None):
                 return result
 
             return sync_wrapper
+
     return decorator
