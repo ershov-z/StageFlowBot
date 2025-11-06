@@ -1,4 +1,5 @@
 # service/timing.py
+import asyncio
 import time
 import functools
 from service.logger import get_logger
