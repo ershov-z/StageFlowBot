@@ -104,12 +104,7 @@ def progress_notifier(context, chat_id, stop_flag):
         if stop_flag.is_set():
             break
         try:
-            # безопасно получаем event loop и вызываем асинхронную задачу
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop_policy().get_event_loop()
-
+            loop = asyncio.get_event_loop_policy().get_event_loop()
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(
                     chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
@@ -172,20 +167,12 @@ def run_generation(data, document, user_id, username, timestamp, context):
             await context.bot.send_document(open(out_path, "rb"), caption=msg)
             logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
-        # безопасный запуск корутины из потока
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
+        loop = asyncio.get_event_loop_policy().get_event_loop()
         asyncio.run_coroutine_threadsafe(send_final(), loop)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-
+        loop = asyncio.get_event_loop_policy().get_event_loop()
         asyncio.run_coroutine_threadsafe(
             context.bot.send_message(user_id, f"❌ Ошибка: {e}"), loop
         )
