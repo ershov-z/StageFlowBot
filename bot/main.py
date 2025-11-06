@@ -1,21 +1,26 @@
 import asyncio
 import logging
+import os
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
 
 from bot import file_manager
 
 # === Инициализация бота ===
-import os
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ BOT_TOKEN not found in environment variables")
 
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+# Новая форма инициализации (Aiogram ≥ 3.7.0)
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher(storage=MemoryStorage())
 
 logging.basicConfig(level=logging.INFO)
@@ -51,11 +56,9 @@ async def handle_docx(message: types.Message):
         logger.info(f"Файл сохранён: {file_path}")
 
         # === 2. Генерируем варианты ===
-        # (ожидается список Arrangement + путь к шаблону)
-        # Пример: zip_buffer = await file_manager.export_variants(arrangements, template_path)
-        # Здесь пока передаём только тестовый вызов
-        zip_buffer = BytesIO(b"")  # временный заглушка
-        logger.info("ZIP с вариантами создан (заглушка)")
+        # Пока можно оставить заглушку, чтобы проверить отправку
+        zip_buffer = BytesIO(b"Test ZIP")
+        logger.info("ZIP с вариантами создан (тестовая заглушка)")
 
         # === 3. Отправляем пользователю ===
         zip_bytes = zip_buffer.getvalue()
