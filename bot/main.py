@@ -22,7 +22,11 @@ from telegram.ext import (
 
 # 👇 Исправленные импорты
 from utils.docx_reader import read_program
-from utils.validator import generate_program_variants
+from utils.validator import (
+    generate_program_variants,
+    request_stop,   # 🛑 STOP FEATURE
+    STOP_FLAG,      # 🛑 STOP FEATURE
+)
 from utils.docx_writer import save_program_to_docx
 
 # ============================================================
@@ -115,7 +119,7 @@ def format_duration(seconds: float) -> str:
 
 
 # ============================================================
-# 🔹 ОБРАБОТЧИКИ
+# 🔹 ОБРАБОТЧИКИ КОМАНД
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,14 +127,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
         "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую, "
-        "переставлю номера и при необходимости добавлю тянучки. "
-        "Формат тегов: %, !, (гк). Не забывай ставить пробел между актёрами перед Enter!"
+        "переставлю номера и при необходимости добавлю тянучки.\n\n"
+        "🛑 В любой момент можешь ввести /stop, чтобы остановить расчёт и получить лучший найденный вариант."
     )
 
+
+# ============================================================
+# 🛑 STOP FEATURE — остановка расчёта
+# ============================================================
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Останавливает расчёт алгоритма и инициирует выбор лучшего результата"""
+    user = update.effective_user
+    logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
+    request_stop()
+    await update.message.reply_text("🛑 Расчёт будет остановлен. Формирую лучший найденный вариант...")
+
+
+# ============================================================
+# 🔹 ОБРАБОТКА ФАЙЛОВ
+# ============================================================
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает docx, парсит, валидирует и возвращает результат"""
     user = update.effective_user
+    chat_id = user.id
     document = update.message.document
 
     if not document.file_name.lower().endswith(".docx"):
@@ -169,25 +190,22 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 Файл получен!\n"
             f"Количество номеров для перестановки — {count}.\n"
             f"Придётся пересчитать {factorial_display} вариантов.\n"
-            f"💪 Процесс может занять несколько минут!"
+            f"💪 Процесс может занять несколько минут!\n\n"
+            f"🛑 При необходимости можно прервать командой /stop"
         )
         await update.message.reply_text(msg)
         logger.info(f"Начинаю подбор вариантов ({count} номеров)...")
 
+        # 2️⃣ ЗАПУСК ВАЛИДАТОРА
         start_time = time.time()
-        variants, stats = generate_program_variants(data)
+        variants, stats = generate_program_variants(data, chat_id=chat_id)
         elapsed = time.time() - start_time
 
         readable_time = format_duration(elapsed)
         logger.info(f"⏱️ Завершено за {readable_time}")
 
-        initial_conflicts = stats.get("initial_conflicts", 0)
-        final_conflicts = stats.get("final_conflicts", 0)
-        tcount = stats.get("tyanuchki_added", 0)
-        total_checked = stats.get("checked_variants", 0)
-
         if not variants:
-            await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
+            await update.message.reply_text("❌ Вариантов программы не нашлось. Попробуйте еще раз!")
             return
 
         result = variants[0]
@@ -196,15 +214,16 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             json.dump(result, f, indent=2, ensure_ascii=False)
 
         tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+
         msg = (
             f"🎬 Программа успешно собрана!\n"
             f"🕓 Время обработки: {readable_time}\n"
-            f"Проверено перестановок: {total_checked}\n"
-            f"Исходных конфликтов: {initial_conflicts}\n"
-            f"Осталось конфликтов: {final_conflicts}\n"
-            f"Добавлено тянучек: {tcount}\n"
+            f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
+            f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
+            f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
+            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}\n"
         )
-        if tcount > 0:
+        if tyan_titles:
             msg += "\n🧩 Добавлены тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
         else:
             msg += "\n✅ Без тянучек!"
@@ -234,6 +253,7 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))  # 🛑 STOP FEATURE
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
 
     logger.info("📡 Переходим в режим polling...")

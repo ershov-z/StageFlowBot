@@ -9,6 +9,26 @@ from loguru import logger
 from utils.telegram_utils import send_message  # ✅ импорт из отдельного модуля
 
 # ============================================================
+# 🛑 STOP FEATURE — глобальный флаг для прерывания расчёта
+# ============================================================
+
+STOP_FLAG = False
+
+
+def request_stop():
+    """Запрашивает остановку текущего перебора"""
+    global STOP_FLAG
+    STOP_FLAG = True
+    logger.warning("🛑 Получен запрос на остановку расчёта!")
+
+
+def reset_stop():
+    """Сбрасывает флаг остановки перед новым запуском"""
+    global STOP_FLAG
+    STOP_FLAG = False
+
+
+# ============================================================
 # 🔧 Вспомогательные проверки
 # ============================================================
 
@@ -45,6 +65,7 @@ def _has_gk(item, name):
 def _has_later(item, name):
     return "later" in _actor_tags(item, name)
 
+
 # ============================================================
 # ⚔️ Конфликты и запрещённые соседства
 # ============================================================
@@ -62,10 +83,8 @@ def _adjacent_conflict(left, right):
 def _adjacency_forbidden(left, right):
     if not (_is_number(left) and _is_number(right)):
         return False
-    # KV подряд запрещено
     if _is_kv(left) and _is_kv(right):
         return True
-    # gk-разрыв запрещён
     shared = {a["name"] for a in left["actors"]} & {a["name"] for a in right["actors"]}
     for actor in shared:
         if _has_gk(left, actor) or _has_gk(right, actor):
@@ -75,6 +94,7 @@ def _adjacency_forbidden(left, right):
 
 def _count_conflicts(program):
     return sum(_adjacent_conflict(program[i], program[i + 1]) for i in range(len(program) - 1))
+
 
 # ============================================================
 # 🧱 Фиксированные позиции
@@ -88,12 +108,12 @@ def _compute_fixed_indices(program):
             fixed.add(i)
     return sorted(fixed), [i for i in range(n) if i not in fixed]
 
+
 # ============================================================
 # 🔍 Проверки KV и gk
 # ============================================================
 
 def _has_kv_violation(program):
-    """True, если два KV-номера идут подряд даже через тянучки."""
     last_kv = None
     for i, p in enumerate(program):
         if _is_number(p) and _is_kv(p):
@@ -106,7 +126,6 @@ def _has_kv_violation(program):
 
 
 def _has_gk_violation(program):
-    """True, если актёр с gk появляется снова, и между появлениями только тянучки."""
     last_seen = {}
     for i, p in enumerate(program):
         if not _is_number(p):
@@ -122,11 +141,13 @@ def _has_gk_violation(program):
             last_seen[name] = i
     return False
 
+
 # ============================================================
 # 🔁 Поиск оптимальных вариантов
 # ============================================================
 
 def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
+    from utils.validator import STOP_FLAG  # предотвращаем циклы импорта
     n = len(program)
     fixed, movable = _compute_fixed_indices(program)
     movables = [program[i] for i in movable]
@@ -142,6 +163,9 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
 
     def backtrack(pos, confs):
         nonlocal checked, best_conf, found_zero
+        if STOP_FLAG:  # 🛑 Пользователь вызвал /stop
+            logger.info("🚫 Остановка поиска по команде /stop")
+            return
         if confs > max_conflicts_allowed or found_zero:
             return
         while pos < n and current[pos] is not None:
@@ -162,6 +186,8 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
         choices = [i for i, u in enumerate(used) if not u]
         random.shuffle(choices)
         for i in choices:
+            if STOP_FLAG:
+                return
             el = movables[i]
             if left and _adjacency_forbidden(left, el):
                 continue
@@ -176,11 +202,12 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
             backtrack(pos + 1, newc)
             used[i] = False
             current[pos] = None
-            if found_zero:
+            if found_zero or STOP_FLAG:
                 return
 
     backtrack(0, 0)
     return best[:max_results], checked
+
 
 # ============================================================
 # 🪶 Добавление тянучек
@@ -233,18 +260,17 @@ def _insert_tyanuchki(program, max_tyanuchki=3):
         i += 1
     return program, tcount
 
+
 # ============================================================
 # 🎯 Основная функция
 # ============================================================
 
 def generate_program_variants(program, chat_id=None, top_n=5):
-    """
-    Генерирует варианты программы с минимальными конфликтами и добавлением тянучек.
-    chat_id — ID пользователя для отправки уведомлений (если есть).
-    """
+    from utils.validator import STOP_FLAG, reset_stop
+    reset_stop()  # сброс при каждом новом запуске
+
     logger.info("🧩 Генерация вариантов программы...")
 
-    # ✅ Отправляем уведомление пользователю (если chat_id известен)
     if chat_id:
         try:
             send_message(chat_id, "Начат подбор вариантов! Это может занять пару минут ⏳")
@@ -261,6 +287,29 @@ def generate_program_variants(program, chat_id=None, top_n=5):
         }
 
     best, checked = _search_best_variants(program)
+    if STOP_FLAG:
+        logger.info("⚙️ Обработка частичных результатов после остановки...")
+        filtered = [(c, p) for c, p in best if c <= 3 and not _has_gk_violation(p)]
+        if not filtered:
+            logger.warning("❌ Нет подходящих вариантов при остановке.")
+            return [], {
+                "checked_variants": checked,
+                "initial_conflicts": None,
+                "final_conflicts": None,
+                "tyanuchki_added": 0,
+            }
+        best_conf, best_prog = sorted(filtered, key=lambda x: x[0])[0]
+        prog = copy.deepcopy(best_prog)
+        prog, added = _insert_tyanuchki(prog, 3)
+        final_conf = _count_conflicts(prog)
+        logger.success(f"🛑 Расчёт остановлен: выбрано с {best_conf} конфликтами → {final_conf} после {added} тянучек")
+        return [prog], {
+            "checked_variants": checked,
+            "initial_conflicts": best_conf,
+            "final_conflicts": final_conf,
+            "tyanuchki_added": added,
+        }
+
     if not best:
         base = _count_conflicts(program)
         return [program], {
@@ -275,7 +324,6 @@ def generate_program_variants(program, chat_id=None, top_n=5):
     prog = copy.deepcopy(best_prog)
     prog, added = _insert_tyanuchki(prog, 3)
 
-    # Финальная KV/gk проверка
     if _has_kv_violation(prog):
         logger.warning("⚠️ Финальный вариант содержит KV подряд — отброшен")
         return [program], {
