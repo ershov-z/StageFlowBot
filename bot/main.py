@@ -99,18 +99,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------
 def progress_notifier(context, chat_id, stop_flag):
     logger.info(f"🔔 Прогресс-монитор для chat_id={chat_id}")
-    loop = context.application.loop
     while not stop_flag.is_set():
         time.sleep(60)
         if stop_flag.is_set():
             break
         try:
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(
-                    context.bot.send_message(
-                        chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
-                    )
-                )
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(
+                    chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
+                ),
+                loop
             )
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить статус: {e}")
@@ -168,15 +167,22 @@ def run_generation(data, document, user_id, username, timestamp, context):
             await context.bot.send_document(open(out_path, "rb"), caption=msg)
             logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
-        # безопасный запуск из потока
-        loop = context.application.loop
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(send_final()))
+        # безопасный запуск корутины из потока
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+        asyncio.run_coroutine_threadsafe(send_final(), loop)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        loop = context.application.loop
-        loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(user_id, f"❌ Ошибка: {e}"), loop
         )
 
 # ------------------------------------------------------------
