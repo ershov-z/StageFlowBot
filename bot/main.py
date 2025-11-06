@@ -5,7 +5,7 @@ import sys
 import json
 import math
 import time
-import threading
+import multiprocessing
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -24,9 +24,9 @@ from utils.docx_reader import read_program
 from utils.validator import (
     generate_program_variants,
     request_stop,   # 🛑 STOP FEATURE
-    STOP_FLAG,      # 🛑 STOP FEATURE
 )
 from utils.docx_writer import save_program_to_docx
+from utils.telegram_utils import send_message  # ✅ для отправки сообщений из процесса
 
 # ============================================================
 # ЛОГИРОВАНИЕ И HEALTH-CHECK
@@ -49,7 +49,8 @@ def health_check():
 def start_health_server():
     def run():
         app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
-    threading.Thread(target=run, daemon=True).start()
+    proc = multiprocessing.Process(target=run, daemon=True)
+    proc.start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
 
 
@@ -62,6 +63,7 @@ def start_keep_alive():
     if not url:
         logger.warning("⚠️ KOYEB_APP_URL не задан, keep-alive отключён")
         return
+
     def ping_loop():
         while True:
             try:
@@ -70,7 +72,9 @@ def start_keep_alive():
             except Exception as e:
                 logger.warning(f"[keep-alive] Ошибка: {e}")
             time.sleep(240)
-    threading.Thread(target=ping_loop, daemon=True).start()
+
+    proc = multiprocessing.Process(target=ping_loop, daemon=True)
+    proc.start()
     logger.info(f"🩵 Keep-alive активирован (ping → {url})")
 
 
@@ -114,6 +118,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     request_stop()
     await update.message.reply_text("📨 Получен сигнал на остановку, завершение в ближайшие секунды...")
 
+
 # ============================================================
 # СТАРТ
 # ============================================================
@@ -127,53 +132,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛑 Командой /stop можно прервать процесс и получить лучший найденный вариант."
     )
 
+
 # ============================================================
-# ОСНОВНАЯ ЛОГИКА
+# ОСНОВНАЯ ЛОГИКА (запускается в отдельном процессе)
 # ============================================================
 
-def run_generation(data, document, user_id, username, timestamp, update):
-    """Выполняется в отдельном потоке, чтобы не блокировать /stop"""
+def run_generation(data, document_path, chat_id, username, timestamp):
+    """Запускается в отдельном процессе, чтобы не блокировать Telegram"""
     try:
         start_time = time.time()
-        variants, stats = generate_program_variants(data, chat_id=user_id)
+        variants, stats = generate_program_variants(data, chat_id=chat_id)
         elapsed = time.time() - start_time
         readable_time = format_duration(elapsed)
 
         if not variants:
-            logger.warning("❌ Вариантов не найдено (STOP_FLAG или пустой результат)")
-            return update.message.reply_text("❌ Вариантов программы не нашлось. Попробуйте еще раз!")
+            send_message(chat_id, "❌ Вариантов программы не нашлось. Попробуйте еще раз!")
+            return
 
         result = variants[0]
-        result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
+        result_json_path = Path(f"data/result_{timestamp}_{chat_id}.json")
         with open(result_json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
 
-        ersho_name = Path(document.file_name).stem + "_ershobot.docx"
-        out_path = Path(f"data/{ersho_name}")
-        save_program_to_docx(result, out_path, original_filename=document.file_name)
+        out_path = Path(f"data/output_{timestamp}_{chat_id}.docx")
+        save_program_to_docx(result, out_path, original_filename=document_path.name)
 
         tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+
         msg = (
             f"🎬 Программа собрана!\n"
             f"🕓 Время: {readable_time}\n"
             f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
-            f"Конфликты: {stats.get('final_conflicts', 0)}\n"
-            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}\n"
+            f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
+            f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
+            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
         )
         if tyan_titles:
-            msg += "\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+            msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
         else:
-            msg += "\n✅ Без тянучек!"
+            msg += "\n\n✅ Без тянучек!"
 
+        send_message(chat_id, f"✅ Готово! Время: {readable_time}")
+        send_message(chat_id, msg)
         logger.info(f"✅ Завершено для @{username} за {readable_time}")
-        update.message.reply_text(f"✅ Готово! Время: {readable_time}")
-        update.message.reply_document(open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
-        update.message.reply_document(open(out_path, "rb"), caption=msg)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        update.message.reply_text(f"❌ Ошибка при обработке файла: {e}")
+        send_message(chat_id, f"❌ Ошибка при обработке файла: {e}")
 
+
+# ============================================================
+# ОБРАБОТКА ФАЙЛОВ
+# ============================================================
 
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -192,16 +202,18 @@ async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed_json_path = Path(f"data/parsed_{timestamp}_{user.id}.json")
     with open(parsed_json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
 
+    await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
     await update.message.reply_text("📊 Начинаю генерацию программы... (можно остановить командой /stop)")
 
-    # Запуск генерации в отдельном потоке
-    threading.Thread(
+    # 🧩 Запуск отдельного процесса для расчёта
+    proc = multiprocessing.Process(
         target=run_generation,
-        args=(data, document, user.id, username, timestamp, update),
+        args=(data, local_path, user.id, username, timestamp),
         daemon=True,
-    ).start()
+    )
+    proc.start()
+    logger.info(f"🚀 Процесс генерации запущен (pid={proc.pid}) для @{username}")
 
 
 # ============================================================
