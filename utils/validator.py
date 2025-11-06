@@ -385,7 +385,7 @@ def _insert_tyanuchki_exact(program: List[Dict[str, Any]], max_tyan: int) -> Tup
     while i < len(prog) - 1:
         if STOP_EVENT.is_set():
             raise StopComputation
-        if tcount > max_tyan:
+        if tcount >= max_tyan:  # FIX: >= — как только достигли лимита, корректно выходим из цикла
             break
 
         left, right = prog[i], prog[i + 1]
@@ -394,8 +394,8 @@ def _insert_tyanuchki_exact(program: List[Dict[str, Any]], max_tyan: int) -> Tup
             continue
 
         if _weak_conflict(left, right):
-            if tcount == max_tyan:
-                return prog, tcount, False
+            if tcount >= max_tyan:
+                break  # FIX: не возвращаем False преждевременно, завершаем фазу вставок
 
             placed = False
             for actor in priority:
