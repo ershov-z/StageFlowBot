@@ -150,7 +150,7 @@ SLEEP_TIME = 0.02
 
 def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_id=None, stop_event: threading.Event = None):
     """Основной бэктрекинг-перебор с мгновенной остановкой и throttling"""
-    stop_event = stop_event or STOP_EVENT  # по умолчанию используем глобальное событие
+    stop_event = stop_event or STOP_EVENT
     n = len(program)
     fixed, movable = _compute_fixed_indices(program)
     movables = [program[i] for i in movable]
@@ -242,6 +242,10 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
                 send_message(chat_id, "🚫 Расчёт остановлен. Отправляю лучший найденный вариант…")
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось уведомить пользователя: {e}")
+        # ✅ Возвращаем найденный лучший вариант даже при стопе
+        if best:
+            logger.info("💾 Возвращаю лучший найденный вариант после остановки.")
+            return best[:max_results], checked
 
     logger.info(f"🔎 Завершён перебор: проверено {checked} вариантов, лучший конфликт={best_conf}")
     return best[:max_results], checked
@@ -321,7 +325,6 @@ def generate_program_variants(program, chat_id=None, top_n=5):
             "tyanuchki_added": 0,
         }
 
-    # ⚠️ Ключевой момент: передаём ссылку на событие остановки
     best, checked = _search_best_variants(program, chat_id=chat_id, stop_event=STOP_EVENT)
 
     if not best:
@@ -340,7 +343,7 @@ def generate_program_variants(program, chat_id=None, top_n=5):
     logger.success(f"🎯 Конфликтов {best_conf} → 0 после добавления {added} тянучек")
     return [prog], {
         "checked_variants": checked,
-        "initial_conflicts": best_conf,  # слабые конфликты ДО тянучек
-        "final_conflicts": 0,            # финально конфликтов нет
+        "initial_conflicts": best_conf,
+        "final_conflicts": 0,
         "tyanuchki_added": added,
     }
