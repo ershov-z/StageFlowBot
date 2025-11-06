@@ -131,17 +131,21 @@ def run_generation(data, document, user_id, username, timestamp, context):
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
             out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
-            save_program_to_docx(result, out_path, original_filename=document.file_name)
+            # 🔧 Используем возвращаемый путь из save_program_to_docx()
+            out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
 
-            tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+            # 🔹 Корректное отображение конфликтов
+            final_conf = stats.get('final_conflicts', 0) or 0
             msg = (
                 f"🎬 Программа собрана!\n"
                 f"🕓 Время: {elapsed}\n"
                 f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
                 f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
-                f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
+                f"Оставшиеся слабые конфликты (до тянучек): {final_conf}\n"
                 f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
             )
+
+            tyan_titles = [x['title'] for x in result if x.get('type') == 'тянучка']
             if tyan_titles:
                 msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
             else:
