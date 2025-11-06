@@ -13,6 +13,7 @@ def measure_time(label: str = None):
     Работает с синхронными и асинхронными функциями.
     """
     def decorator(func):
+        # важно: используем только глобальный импорт asyncio
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
@@ -28,6 +29,7 @@ def measure_time(label: str = None):
             return async_wrapper
 
         else:
+
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
                 tag = label or func.__name__
