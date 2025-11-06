@@ -73,15 +73,15 @@ def format_duration(s: float) -> str:
     return f"{m} мин {sec} сек" if m else f"{sec} сек"
 
 
-def safe_create_task(context, coro):
-    """Потокобезопасный запуск корутины, если приложение активно"""
+def run_async_safely(coro):
+    """Запускает корутину даже если нет активного event loop (безопасно для потоков)"""
     try:
-        if context.application and getattr(context.application, "running", False):
-            context.application.create_task(coro)
-        else:
-            logger.warning("⚠️ Application неактивно — задача не запущена.")
-    except Exception as e:
-        logger.error(f"Ошибка при создании задачи: {e}")
+        asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(coro)
+        loop.close()
 
 # ------------------------------------------------------------
 # STOP
@@ -115,8 +115,7 @@ def progress_notifier(context, chat_id, stop_flag):
         if stop_flag.is_set():
             break
         try:
-            safe_create_task(
-                context,
+            run_async_safely(
                 context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
             )
         except Exception as e:
@@ -128,15 +127,6 @@ def progress_notifier(context, chat_id, stop_flag):
 # ------------------------------------------------------------
 def run_generation(data, document, user_id, username, timestamp, context):
     try:
-        # Watchdog: ограничим количество параллельных потоков
-        if threading.active_count() > 20:
-            logger.warning("🚨 Превышено количество активных потоков — новый расчёт не запущен.")
-            safe_create_task(
-                context,
-                context.bot.send_message(user_id, "⚠️ Сервер занят, попробуйте позже.")
-            )
-            return
-
         start_time = time.time()
         stop_flag = threading.Event()
         threading.Thread(target=progress_notifier, args=(context, user_id, stop_flag), daemon=True).start()
@@ -155,7 +145,6 @@ def run_generation(data, document, user_id, username, timestamp, context):
                     return
 
                 result = variants[0]
-
                 result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
                 with open(result_json_path, "w", encoding="utf-8") as f:
                     json.dump(result, f, indent=2, ensure_ascii=False)
@@ -186,7 +175,6 @@ def run_generation(data, document, user_id, username, timestamp, context):
                     await context.bot.send_document(jf, caption="📗 Итоговая программа (JSON):")
                 with open(out_path, "rb") as df:
                     await context.bot.send_document(df, caption=msg)
-
                 logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
             except Exception as e:
                 logger.exception(f"Ошибка в send_final для @{username}: {e}")
@@ -195,11 +183,15 @@ def run_generation(data, document, user_id, username, timestamp, context):
                 except Exception as e2:
                     logger.error(f"Не удалось уведомить пользователя: {e2}")
 
-        safe_create_task(context, send_final())
+        # 🧠 Запускаем безопасно даже при завершённом PTB loop
+        run_async_safely(send_final())
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        safe_create_task(context, context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+        try:
+            run_async_safely(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+        except Exception as e2:
+            logger.error(f"Не удалось уведомить пользователя об ошибке: {e2}")
 
 # ------------------------------------------------------------
 # ОБРАБОТКА ДОКУМЕНТОВ
@@ -258,12 +250,10 @@ def main():
     logger.info("🚀 Запуск Telegram-бота...")
     start_health_server()
     start_keep_alive()
-
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
-
     logger.info("✅ Хэндлеры загружены. Бот готов к приёму документов.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
