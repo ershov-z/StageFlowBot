@@ -3,7 +3,7 @@
 # 🧠 Telegram бот для автоматического подбора программы концерта
 # ============================================================
 
-import os, sys, json, math, time, threading, requests
+import os, sys, json, math, time, threading, requests, asyncio
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -25,15 +25,15 @@ logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
 app_health = Flask(__name__)
 
 @app_health.route("/")
-def root(): 
+def root():
     return "OK"
 
 @app_health.route("/health")
-def health(): 
+def health():
     return {"status": "healthy"}, 200
 
 def start_health_server():
-    def run(): 
+    def run():
         app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
     threading.Thread(target=run, daemon=True).start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
@@ -106,7 +106,7 @@ def progress_notifier(context, chat_id, stop_flag):
             break
         try:
             loop.call_soon_threadsafe(
-                lambda: loop.create_task(
+                lambda: asyncio.create_task(
                     context.bot.send_message(
                         chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты."
                     )
@@ -147,7 +147,7 @@ def run_generation(data, document, user_id, username, timestamp, context):
             out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
             logger.info(f"📄 DOCX сгенерирован: {out_path}")
 
-            final_conf = stats.get('final_conflicts', 0) or 0
+            final_conf = stats.get("final_conflicts", 0) or 0
             msg = (
                 f"🎬 Программа собрана!\n"
                 f"🕓 Время: {elapsed}\n"
@@ -157,7 +157,7 @@ def run_generation(data, document, user_id, username, timestamp, context):
                 f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
             )
 
-            tyan_titles = [x['title'] for x in result if x.get('type') == 'тянучка']
+            tyan_titles = [x["title"] for x in result if x.get("type") == "тянучка"]
             if tyan_titles:
                 msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
             else:
@@ -168,15 +168,15 @@ def run_generation(data, document, user_id, username, timestamp, context):
             await context.bot.send_document(open(out_path, "rb"), caption=msg)
             logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
 
-        # 🔧 ВАЖНО: безопасный запуск в основном loop
+        # безопасный запуск из потока
         loop = context.application.loop
-        loop.call_soon_threadsafe(lambda: loop.create_task(send_final()))
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(send_final()))
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
         loop = context.application.loop
         loop.call_soon_threadsafe(
-            lambda: loop.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+            lambda: asyncio.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
         )
 
 # ------------------------------------------------------------
