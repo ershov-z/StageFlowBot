@@ -10,7 +10,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot import file_manager
 
 # === Инициализация бота ===
-TOKEN = "YOUR_BOT_TOKEN_HERE"
+import os
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN not found in environment variables")
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(storage=MemoryStorage())
 
