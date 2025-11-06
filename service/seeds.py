@@ -24,5 +24,6 @@ def generate_unique_seeds(n: int = 5) -> list[int]:
 
 # ✅ алиас для совместимости с main.py
 def generate_seeds(n: int = 5) -> list[int]:
+    return generate_unique_seeds(n)
     """Совместимый алиас, используется ботом (main.py)."""
     return generate_unique_seeds(n)
