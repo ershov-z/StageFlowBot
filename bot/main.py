@@ -1,265 +1,244 @@
 # bot/main.py
-# ============================================================
-# 🧠 Telegram бот для автоматического подбора программы концерта
-# (оптимизирован для работы на Koyeb)
-# ============================================================
 
-import os, sys, json, math, time, threading, requests, multiprocessing
-from queue import Queue
+import os
+import sys
+import json
+import math
+import time
+import threading
+import requests  # 🩵 KEEP-ALIVE FIX for Koyeb
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
+# 👇 Исправленные импорты
 from utils.docx_reader import read_program
-from utils.validator import generate_program_variants, request_stop
+from utils.validator import generate_program_variants
 from utils.docx_writer import save_program_to_docx
-from utils.telegram_utils import send_message, send_document
 
-# ------------------------------------------------------------
-# ЛОГИРОВАНИЕ И HEALTH-CHECK
-# ------------------------------------------------------------
+# ============================================================
+# 🔧 НАСТРОЙКА ЛОГИРОВАНИЯ
+# ============================================================
+
 os.makedirs("logs", exist_ok=True)
 os.makedirs("data", exist_ok=True)
+logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
 
-logger.add(
-    "logs/bot_{time:YYYYMMDD}.log",
-    rotation="10 MB",
-    retention="7 days",
-    compression="zip",
-    level="DEBUG",
-)
+# ============================================================
+# 🌐 HEALTH CHECK (для Koyeb)
+# ============================================================
 
 app_health = Flask(__name__)
 
 @app_health.route("/")
-def root():
+def health_root():
     return "OK"
 
 @app_health.route("/health")
-def health():
+def health_check():
     return {"status": "healthy"}, 200
 
+
 def start_health_server():
+    """Запускает Flask-сервер в отдельном потоке (порт 8000)"""
     def run():
         app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
-    threading.Thread(target=run, daemon=True).start()
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
 
-# ------------------------------------------------------------
-# KEEP-ALIVE
-# ------------------------------------------------------------
+
+# ============================================================
+# 🩵 KEEP-ALIVE FIX for Koyeb
+# ============================================================
+
 def start_keep_alive():
+    """Периодически пингует Koyeb-приложение, чтобы оно не засыпало"""
     url = os.getenv("KOYEB_APP_URL")
     if not url:
-        logger.warning("⚠️ KOYEB_APP_URL не задан, keep-alive отключён")
+        logger.warning("⚠️ Переменная KOYEB_APP_URL не задана, keep-alive отключён")
         return
-    def loop():
+
+    def ping_loop():
         while True:
             try:
-                requests.get(url, timeout=10)
+                requests.get(url)
                 logger.debug(f"[keep-alive] Пинг {url} успешен")
             except Exception as e:
-                logger.warning(f"[keep-alive] Ошибка keep-alive: {e}")
-            time.sleep(240)
-    threading.Thread(target=loop, daemon=True).start()
+                logger.warning(f"[keep-alive] Ошибка: {e}")
+            time.sleep(240)  # каждые 4 минуты
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
     logger.info(f"🩵 Keep-alive активирован (ping → {url})")
 
-# ------------------------------------------------------------
-# TOKEN
-# ------------------------------------------------------------
-TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+
+# ============================================================
+# 🔹 ИНИЦИАЛИЗАЦИЯ БОТА
+# ============================================================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
+TOKEN = TELEGRAM_TOKEN.strip()
+
 if not TOKEN:
-    logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN)")
+    logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN). Завершение работы.")
     sys.exit(1)
+else:
+    logger.info(f"🔑 Токен найден, длина: {len(TOKEN)}")
 
-# ------------------------------------------------------------
-# Путь к списку актёров (для стабильной загрузки в Koyeb)
-# ------------------------------------------------------------
-ACTORS_PATH = Path(__file__).resolve().parent / "actors_list.json"
-os.environ["ACTORS_PATH"] = str(ACTORS_PATH)
 
-# ------------------------------------------------------------
-# STOP
-# ------------------------------------------------------------
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
-    request_stop()
-    await update.message.reply_text(
-        "📨 Получен сигнал на остановку. Расчёт будет завершён — ожидайте итоговый вариант..."
-    )
+# ============================================================
+# 🕒 ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ФОРМАТИРОВАНИЯ ВРЕМЕНИ
+# ============================================================
 
-# ------------------------------------------------------------
-# START
-# ------------------------------------------------------------
+def format_duration(seconds: float) -> str:
+    """Преобразует секунды в человекочитаемый формат"""
+    minutes = int(seconds // 60)
+    sec = int(seconds % 60)
+    if minutes == 0:
+        return f"{sec} сек"
+    elif minutes < 60:
+        return f"{minutes} мин {sec} сек"
+    else:
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours} ч {minutes} мин {sec} сек"
+
+
+# ============================================================
+# 🔹 ОБРАБОТЧИКИ
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"👋 Пользователь @{user.username} запустил бота.")
+    logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
-        "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую и переставлю номера.\n\n"
-        "🛑 Командой /stop можно прервать процесс и получить лучший найденный вариант."
+        "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую, "
+        "переставлю номера и при необходимости добавлю тянучки. "
+        "Формат тегов: %, !, (гк). Не забывай ставить пробел между актёрами перед Enter!"
     )
 
-# ------------------------------------------------------------
-# ПРОГРЕСС-МОНТОР
-# ------------------------------------------------------------
-def progress_notifier(chat_id, stop_flag):
-    logger.info(f"🔔 Прогресс-монитор запущен для chat_id={chat_id}")
-    while not stop_flag.is_set():
-        time.sleep(180)  # уведомление раз в 3 минуты, чтобы избежать flood limit
-        if stop_flag.is_set():
-            break
-        try:
-            send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить статус пользователю {chat_id}: {e}")
-    logger.info(f"🛑 Монитор завершён для chat_id={chat_id}")
 
-# ------------------------------------------------------------
-# ОГРАНИЧЕНИЕ ОДНОВРЕМЕННЫХ ЗАДАЧ
-# ------------------------------------------------------------
-TASK_QUEUE = Queue(maxsize=3)
-
-# ------------------------------------------------------------
-# ОСНОВНАЯ ГЕНЕРАЦИЯ
-# ------------------------------------------------------------
-def run_generation(data, document, user_id, username, timestamp):
-    try:
-        start_time = time.time()
-        stop_flag = threading.Event()
-        threading.Thread(target=progress_notifier, args=(user_id, stop_flag), daemon=True).start()
-
-        logger.info(f"📦 Запуск generate_program_variants() для @{username}")
-        variants, stats = generate_program_variants(data, chat_id=user_id)
-        stop_flag.set()
-
-        elapsed_sec = time.time() - start_time
-        elapsed = f"{int(elapsed_sec // 60)} мин {int(elapsed_sec % 60)} сек"
-        logger.info(f"✅ Расчёт завершён для @{username}, время: {elapsed}")
-
-        if not variants:
-            send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
-            return
-
-        result = variants[0]
-        result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
-        with open(result_json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        logger.info(f"📤 JSON сохранён: {result_json_path}")
-
-        out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
-        out_path = Path(save_program_to_docx(result, out_path, original_filename=document.file_name))
-        logger.info(f"📄 DOCX сгенерирован: {out_path}")
-
-        final_conf = stats.get("final_conflicts", 0) or 0
-        msg = (
-            f"🎬 Программа собрана!\n"
-            f"🕓 Время: {elapsed}\n"
-            f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
-            f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
-            f"Оставшиеся слабые конфликты (до тянучек): {final_conf}\n"
-            f"Добавлено тянучек: {stats.get('tyanuchki_added', 0)}"
-        )
-
-        tyan_titles = [x["title"] for x in result if x.get("type") == "тянучка"]
-        if tyan_titles:
-            msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
-        else:
-            msg += "\n\n✅ Без тянучек!"
-
-        send_message(user_id, "📤 Отправляю итоговые документы... ⏳")
-        send_document(user_id, str(result_json_path), "📗 Итоговая программа (JSON):")
-        send_document(user_id, str(out_path), msg)
-        send_message(user_id, f"✅ Готово! Время: {elapsed}")
-        logger.info(f"📨 Итоговые файлы отправлены пользователю @{username}")
-
-    except Exception as e:
-        logger.exception(f"Ошибка генерации для @{username}: {e}")
-        try:
-            send_message(user_id, f"❌ Ошибка: {e}")
-        except Exception as e2:
-            logger.error(f"Не удалось уведомить пользователя об ошибке: {e2}")
-    finally:
-        # освобождаем слот в очереди
-        if "TASK_QUEUE" in globals():
-            TASK_QUEUE.get()
-            TASK_QUEUE.task_done()
-
-# ------------------------------------------------------------
-# ОБРАБОТКА ДОКУМЕНТОВ
-# ------------------------------------------------------------
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает docx, парсит, валидирует и возвращает результат"""
     user = update.effective_user
-    username = user.username or "unknown"
     document = update.message.document
 
-    logger.info(f"📥 Получен файл {document.file_name} от @{username}")
     if not document.file_name.lower().endswith(".docx"):
-        await update.message.reply_text("⚠️ Отправь файл в формате .docx.")
-        logger.warning(f"⚠️ @{username} отправил неподдерживаемый файл: {document.file_name}")
+        await update.message.reply_text("⚠️ Отправь файл в формате .docx, пожалуйста.")
         return
 
-    if TASK_QUEUE.full():
-        await update.message.reply_text("⚠️ Сервер сейчас занят, попробуй позже.")
-        logger.warning(f"⚠️ Пропуск задачи: очередь переполнена (пользователь @{username})")
-        return
-    TASK_QUEUE.put(1)
-
+    logger.info(f"📄 Получен .docx от @{user.username}: {document.file_name}")
     file = await document.get_file()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_path = Path(f"data/{timestamp}__{document.file_name}")
     await file.download_to_drive(local_path)
-    logger.info(f"📂 Файл сохранён локально: {local_path}")
+    logger.info(f"📥 Файл сохранён: {local_path}")
 
-    data = read_program(local_path)
-    parsed_json_path = Path(f"data/parsed_{timestamp}_{user.id}.json")
-    with open(parsed_json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        # 1️⃣ ПАРСИНГ
+        data = read_program(local_path)
+        logger.info(f"✅ Прочитано {len(data)} строк.")
+        parsed_json_path = Path(f"data/parsed_{timestamp}_{user.id}.json")
+        with open(parsed_json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
-    # безопасное закрытие файла
-    with open(parsed_json_path, "rb") as f:
-        await update.message.reply_document(f, caption="📘 Исходные данные после парсинга:")
-    logger.info(f"📄 JSON отправлен пользователю @{username}: {parsed_json_path}")
+        await update.message.reply_document(
+            open(parsed_json_path, "rb"),
+            caption="📘 Исходные данные после парсинга:",
+        )
 
-    movable = [i for i, x in enumerate(data)
-               if x.get("type") == "обычный" and 2 < i < len(data) - 2]
-    count = len(movable)
-    factorial_display = str(math.factorial(count)) if count <= 10 else f"≈ {math.factorial(10):.2e}+"
-    msg = (
-        f"📦 Файл получен!\n"
-        f"Количество номеров для перестановки — {count}.\n"
-        f"Придётся пересчитать {factorial_display} вариантов.\n"
-        f"💪 Подготовка данных, ожидайте запуска перебора!\n\n"
-        f"🛑 Можно остановить командой /stop"
-    )
-    await update.message.reply_text(msg)
-    logger.info(f"📊 Начинается расчёт {count}! вариантов для @{username}")
+        movable = [i for i, x in enumerate(data)
+                   if x.get("type") == "обычный" and 2 < i < len(data) - 2]
+        count = len(movable)
+        factorial_display = (
+            str(math.factorial(count)) if count <= 10 else f"≈ {math.factorial(10):.2e}+ (ограничено)"
+        )
 
-    # запуск расчёта в отдельном процессе
-    process = multiprocessing.Process(
-        target=run_generation,
-        args=(data, document, user.id, username, timestamp),
-        daemon=True,
-    )
-    process.start()
-    logger.info(f"🚀 Подпроцесс генерации запущен (pid={process.pid}) для @{username}")
+        msg = (
+            f"📦 Файл получен!\n"
+            f"Количество номеров для перестановки — {count}.\n"
+            f"Придётся пересчитать {factorial_display} вариантов.\n"
+            f"💪 Процесс может занять несколько минут!"
+        )
+        await update.message.reply_text(msg)
+        logger.info(f"Начинаю подбор вариантов ({count} номеров)...")
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
+        start_time = time.time()
+        variants, stats = generate_program_variants(data)
+        elapsed = time.time() - start_time
+
+        readable_time = format_duration(elapsed)
+        logger.info(f"⏱️ Завершено за {readable_time}")
+
+        initial_conflicts = stats.get("initial_conflicts", 0)
+        final_conflicts = stats.get("final_conflicts", 0)
+        tcount = stats.get("tyanuchki_added", 0)
+        total_checked = stats.get("checked_variants", 0)
+
+        if not variants:
+            await update.message.reply_text("❌ Не удалось собрать программу даже с тянучками.")
+            return
+
+        result = variants[0]
+        result_json_path = Path(f"data/result_{timestamp}_{user.id}.json")
+        with open(result_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+        msg = (
+            f"🎬 Программа успешно собрана!\n"
+            f"🕓 Время обработки: {readable_time}\n"
+            f"Проверено перестановок: {total_checked}\n"
+            f"Исходных конфликтов: {initial_conflicts}\n"
+            f"Осталось конфликтов: {final_conflicts}\n"
+            f"Добавлено тянучек: {tcount}\n"
+        )
+        if tcount > 0:
+            msg += "\n🧩 Добавлены тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+        else:
+            msg += "\n✅ Без тянучек!"
+
+        out_path = Path(f"data/output_{timestamp}_{user.id}.docx")
+        save_program_to_docx(result, out_path, original_filename=document.file_name)
+        ersho_name = Path(document.file_name).stem + "_ershobot.docx"
+        ersho_path = Path("data") / ersho_name
+
+        await update.message.reply_text(f"✅ Готово! Время: {readable_time}")
+        await update.message.reply_document(open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
+        await update.message.reply_document(open(ersho_path, "rb"), caption=msg)
+
+    except Exception as e:
+        logger.exception(f"Ошибка при обработке docx: {e}")
+        await update.message.reply_text(f"❌ Ошибка при обработке файла: {e}")
+
+
+# ============================================================
+# 🔹 ОСНОВНОЙ ЗАПУСК
+# ============================================================
+
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
     start_health_server()
-    start_keep_alive()
+    start_keep_alive()  # 🩵 активируем keep-alive
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
-    logger.info("✅ Хэндлеры загружены. Бот готов к приёму документов.")
+
+    logger.info("📡 Переходим в режим polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
