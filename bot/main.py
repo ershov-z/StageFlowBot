@@ -73,14 +73,17 @@ def format_duration(s: float) -> str:
     return f"{m} мин {sec} сек" if m else f"{sec} сек"
 
 
-def run_async_safely(coro):
-    """Запускает корутину даже если нет активного event loop (безопасно для потоков)"""
+def run_async_safely(coro_func):
+    """Запускает корутину безопасно из любого потока"""
     try:
-        asyncio.run(coro)
+        # если event loop уже существует
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro_func())
     except RuntimeError:
+        # если вызывается из обычного потока — создаём новый цикл
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(coro)
+        loop.run_until_complete(coro_func())
         loop.close()
 
 # ------------------------------------------------------------
@@ -116,7 +119,7 @@ def progress_notifier(context, chat_id, stop_flag):
             break
         try:
             run_async_safely(
-                context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
+                lambda: context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
             )
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить статус пользователю {chat_id}: {e}")
@@ -183,13 +186,13 @@ def run_generation(data, document, user_id, username, timestamp, context):
                 except Exception as e2:
                     logger.error(f"Не удалось уведомить пользователя: {e2}")
 
-        # 🧠 Запускаем безопасно даже при завершённом PTB loop
-        run_async_safely(send_final())
+        # 🧠 Запуск безопасного вызова корутины из потока
+        run_async_safely(send_final)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
         try:
-            run_async_safely(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
+            run_async_safely(lambda: context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
         except Exception as e2:
             logger.error(f"Не удалось уведомить пользователя об ошибке: {e2}")
 
