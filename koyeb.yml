@@ -1,19 +1,16 @@
-name: stageflow-bot
+name: stageflow-v2
+type: web
 
-services:
-  - name: bot
-    type: worker
-    build:
-      type: docker
-      dockerfile: ./Dockerfile
+build:
+  commands:
+    - echo "🧹 Cleaning previous build..."
+    - rm -rf __pycache__/ build/ dist/ .pytest_cache/ .venv/
+    - find . -type f -name '*.pyc' -delete
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
 
-    deployment:
-      strategy: replace
-
-    scaling:
-      min: 1
-      max: 1
-
-    env:
-      - key: BOT_TOKEN
-        value: ${BOT_TOKEN}
+run:
+  command: python -m bot.main
+  healthcheck:
+    path: /health
+    interval: 240s
