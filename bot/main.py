@@ -14,6 +14,7 @@ import os
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ BOT_TOKEN not found in environment variables")
+
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -46,12 +47,15 @@ async def handle_docx(message: types.Message):
 
     try:
         # === 1. Скачиваем файл ===
-        file_path = await file_manager.download_file(bot, document)
+        file_path = await file_manager.download_docx(bot, document)
         logger.info(f"Файл сохранён: {file_path}")
 
         # === 2. Генерируем варианты ===
-        zip_buffer = await file_manager.export_variants(file_path)
-        logger.info("ZIP с вариантами создан")
+        # (ожидается список Arrangement + путь к шаблону)
+        # Пример: zip_buffer = await file_manager.export_variants(arrangements, template_path)
+        # Здесь пока передаём только тестовый вызов
+        zip_buffer = BytesIO(b"")  # временный заглушка
+        logger.info("ZIP с вариантами создан (заглушка)")
 
         # === 3. Отправляем пользователю ===
         zip_bytes = zip_buffer.getvalue()
