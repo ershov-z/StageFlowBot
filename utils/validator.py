@@ -5,6 +5,7 @@
 
 import copy
 import random
+import time
 from loguru import logger
 from utils.telegram_utils import send_message  # ✅ импорт из отдельного модуля
 
@@ -146,7 +147,11 @@ def _has_gk_violation(program):
 # 🔁 Поиск оптимальных вариантов
 # ============================================================
 
-def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
+def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_id=None):
+    """
+    ВАЖНО: chat_id передаётся только для одноразового уведомления,
+    когда реальный перебор действительно стартовал.
+    """
     from utils.validator import STOP_FLAG
     n = len(program)
     fixed, movable = _compute_fixed_indices(program)
@@ -161,14 +166,27 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
     best, checked, best_conf = [], 0, float("inf")
     found_zero = False
     iteration = 0  # для отладки
+    notified_started = False  # 🔔 уведомление о старте реального перебора (один раз)
 
     def backtrack(pos, confs):
-        nonlocal checked, best_conf, found_zero, iteration
+        nonlocal checked, best_conf, found_zero, iteration, notified_started
+
+        # одноразовая точка: как только реально зашли в backtrack — шлём уведомление
+        if not notified_started:
+            notified_started = True
+            if chat_id:
+                try:
+                    send_message(chat_id, "🚀 Реальный перебор запущен: начинаю проверять перестановки.")
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось отправить уведомление о старте перебора: {e}")
+
         if STOP_FLAG:
             logger.info("🧩 STOP_FLAG активен — прерываю расчёт")
             return
         if confs > max_conflicts_allowed or found_zero:
             return
+
+        # перейти на следующую пустую позицию
         while pos < n and current[pos] is not None:
             pos += 1
         if pos >= n:
@@ -176,6 +194,11 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
             iteration += 1
             if iteration % 50 == 0:
                 logger.debug(f"🔍 Проверено {checked} вариантов...")
+                if STOP_FLAG:
+                    logger.info("🧩 STOP_FLAG пойман на чекпоинте — выходим")
+                    return
+                # небольшая уступка планировщику
+                time.sleep(0)
             if _has_kv_violation(current) or _has_gk_violation(current):
                 return
             if confs <= best_conf:
@@ -190,6 +213,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3):
         left = current[pos - 1] if pos > 0 else None
         choices = [i for i, u in enumerate(used) if not u]
         random.shuffle(choices)
+
         for i in choices:
             if STOP_FLAG:
                 logger.info("🧩 STOP_FLAG сработал во время итерации — выходим")
@@ -280,6 +304,7 @@ def generate_program_variants(program, chat_id=None, top_n=5):
 
     if chat_id:
         try:
+            # предуведомление — запуск пайплайна
             send_message(chat_id, "Начат подбор вариантов! Это может занять пару минут ⏳")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось отправить сообщение в Telegram: {e}")
@@ -293,7 +318,9 @@ def generate_program_variants(program, chat_id=None, top_n=5):
             "tyanuchki_added": 0,
         }
 
-    best, checked = _search_best_variants(program)
+    # передаём chat_id внутрь поиска — чтобы прислать сигнал, когда начнётся реальный перебор
+    best, checked = _search_best_variants(program, chat_id=chat_id)
+
     if STOP_FLAG:
         logger.info("⚙️ Обработка частичных результатов после остановки...")
         filtered = [(c, p) for c, p in best if c <= 3 and not _has_gk_violation(p)]

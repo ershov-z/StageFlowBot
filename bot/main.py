@@ -3,34 +3,21 @@
 # 🧠 Telegram бот для автоматического подбора программы концерта
 # ============================================================
 
-import os
-import sys
-import json
-import math
-import time
-import threading
-import requests
+import os, sys, json, math, time, threading, requests
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 from flask import Flask
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 from utils.docx_reader import read_program
 from utils.validator import generate_program_variants, request_stop
 from utils.docx_writer import save_program_to_docx
 
-# ============================================================
-# 🔧 ЛОГИРОВАНИЕ И HEALTH-CHECK
-# ============================================================
-
+# ------------------------------------------------------------
+# ЛОГИРОВАНИЕ И HEALTH-CHECK
+# ------------------------------------------------------------
 os.makedirs("logs", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
@@ -38,30 +25,25 @@ logger.add("logs/bot_{time:YYYYMMDD}.log", rotation="10 MB", level="DEBUG")
 app_health = Flask(__name__)
 
 @app_health.route("/")
-def health_root():
-    return "OK"
+def root(): return "OK"
 
 @app_health.route("/health")
-def health_check():
-    return {"status": "healthy"}, 200
+def health(): return {"status": "healthy"}, 200
 
 def start_health_server():
-    def run():
-        app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
+    def run(): app_health.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
     threading.Thread(target=run, daemon=True).start()
     logger.info("💓 Health-check сервер запущен на порту 8000")
 
-
-# ============================================================
-# 🩵 KEEP-ALIVE
-# ============================================================
-
+# ------------------------------------------------------------
+# KEEP-ALIVE
+# ------------------------------------------------------------
 def start_keep_alive():
     url = os.getenv("KOYEB_APP_URL")
     if not url:
         logger.warning("⚠️ KOYEB_APP_URL не задан, keep-alive отключён")
         return
-    def ping_loop():
+    def loop():
         while True:
             try:
                 requests.get(url)
@@ -69,200 +51,162 @@ def start_keep_alive():
             except Exception as e:
                 logger.warning(f"[keep-alive] Ошибка: {e}")
             time.sleep(240)
-    threading.Thread(target=ping_loop, daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
     logger.info(f"🩵 Keep-alive активирован (ping → {url})")
 
-
-# ============================================================
-# 🔑 TOKEN
-# ============================================================
-
+# ------------------------------------------------------------
+# TOKEN
+# ------------------------------------------------------------
 TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
     logger.error("❌ Не найден TELEGRAM_TOKEN (или BOT_TOKEN)")
     sys.exit(1)
-else:
-    logger.info(f"🔑 Токен найден ({len(TOKEN)} символов)")
 
+# ------------------------------------------------------------
+# ВСПОМОГАТЕЛЬНЫЕ
+# ------------------------------------------------------------
+def format_duration(s: float) -> str:
+    m, sec = divmod(int(s), 60)
+    return f"{m} мин {sec} сек" if m else f"{sec} сек"
 
-# ============================================================
-# 🕒 ВСПОМОГАТЕЛЬНЫЕ
-# ============================================================
-
-def format_duration(seconds: float) -> str:
-    minutes = int(seconds // 60)
-    sec = int(seconds % 60)
-    if minutes == 0:
-        return f"{sec} сек"
-    elif minutes < 60:
-        return f"{minutes} мин {sec} сек"
-    else:
-        hours = minutes // 60
-        minutes = minutes % 60
-        return f"{hours} ч {minutes} мин {sec} сек"
-
-
-# ============================================================
-# 🛑 STOP FEATURE
-# ============================================================
-
+# ------------------------------------------------------------
+# STOP
+# ------------------------------------------------------------
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Останавливает расчёт алгоритма"""
     user = update.effective_user
     logger.warning(f"🛑 Пользователь @{user.username} запросил остановку расчёта")
     request_stop()
     await update.message.reply_text("📨 Получен сигнал на остановку. Завершение расчёта...")
 
-
-# ============================================================
-# /start
-# ============================================================
-
+# ------------------------------------------------------------
+# START
+# ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"/start от @{user.username} (id={user.id})")
     await update.message.reply_text(
-        "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую, "
-        "переставлю номера и при необходимости добавлю тянучки.\n\n"
+        "👋 Привет! Отправь мне .docx с программой концерта — я её проанализирую и переставлю номера.\n\n"
         "🛑 Командой /stop можно прервать процесс и получить лучший найденный вариант."
     )
 
-
-# ============================================================
-# 🔁 ПРОГРЕСС-МОНТОР
-# ============================================================
-
+# ------------------------------------------------------------
+# ПРОГРЕСС-МОНТОР
+# ------------------------------------------------------------
 def progress_notifier(context, chat_id, stop_flag):
-    """Отправляет напоминание каждые 60 секунд, пока идёт генерация"""
-    logger.info(f"🔔 Запущен прогресс-монитор для chat_id={chat_id}")
+    logger.info(f"🔔 Прогресс-монитор для chat_id={chat_id}")
     while not stop_flag.is_set():
         time.sleep(60)
-        if stop_flag.is_set():
-            break
+        if stop_flag.is_set(): break
         try:
             context.application.create_task(
                 context.bot.send_message(chat_id, "⏳ Расчёт продолжается... бот всё ещё подбирает варианты.")
             )
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить статусное сообщение: {e}")
-    logger.info(f"🛑 Прогресс-монитор остановлен для chat_id={chat_id}")
+            logger.warning(f"⚠️ Не удалось отправить статус: {e}")
+    logger.info(f"🛑 Монитор завершён для chat_id={chat_id}")
 
-
-# ============================================================
-# 🧩 ОСНОВНАЯ ЛОГИКА ГЕНЕРАЦИИ
-# ============================================================
-
+# ------------------------------------------------------------
+# ОСНОВНАЯ ГЕНЕРАЦИЯ
+# ------------------------------------------------------------
 def run_generation(data, document, user_id, username, timestamp, context):
-    """Запускается в отдельном потоке, чтобы не блокировать Telegram"""
     try:
         start_time = time.time()
-
-        # Флаг для уведомлений
         stop_flag = threading.Event()
-        monitor_thread = threading.Thread(
-            target=progress_notifier, args=(context, user_id, stop_flag), daemon=True
-        )
-        monitor_thread.start()
+        threading.Thread(target=progress_notifier, args=(context, user_id, stop_flag), daemon=True).start()
 
-        # Основная генерация
         variants, stats = generate_program_variants(data, chat_id=user_id)
-        stop_flag.set()  # остановить монитор после завершения
+        stop_flag.set()
 
-        elapsed = time.time() - start_time
-        readable_time = format_duration(elapsed)
+        elapsed = format_duration(time.time() - start_time)
 
         async def send_final():
             if not variants:
-                await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте еще раз!")
+                await context.bot.send_message(user_id, "❌ Вариантов программы не нашлось. Попробуйте ещё раз!")
                 return
-
             result = variants[0]
-            result_json_path = Path(f"data/result_{timestamp}_{user_id}.json")
-            with open(result_json_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
-
-            out_path = Path(f"data/output_{timestamp}_{user_id}.docx")
-            save_program_to_docx(result, out_path, original_filename=document.file_name)
-
-            tyan_titles = [x["title"] for x in result if x["type"] == "тянучка"]
+            js = Path(f"data/result_{timestamp}_{user_id}.json")
+            with open(js, "w", encoding="utf-8") as f: json.dump(result, f, indent=2, ensure_ascii=False)
+            out = Path(f"data/output_{timestamp}_{user_id}.docx")
+            save_program_to_docx(result, out, original_filename=document.file_name)
+            tyan = [x["title"] for x in result if x["type"] == "тянучка"]
             msg = (
                 f"🎬 Программа собрана!\n"
-                f"🕓 Время: {readable_time}\n"
-                f"Проверено перестановок: {stats.get('checked_variants', 0)}\n"
-                f"Исходных конфликтов: {stats.get('initial_conflicts', 0)}\n"
-                f"Осталось конфликтов: {stats.get('final_conflicts', 0)}\n"
-                f"Добавлено тянучек: {stats.get('tyanuchки_added', 0)}"
+                f"🕓 Время: {elapsed}\n"
+                f"Проверено перестановок: {stats.get('checked_variants',0)}\n"
+                f"Исходных конфликтов: {stats.get('initial_conflicts',0)}\n"
+                f"Осталось конфликтов: {stats.get('final_conflicts',0)}\n"
+                f"Добавлено тянучек: {stats.get('tyanuchки_added',0)}"
             )
-            if tyan_titles:
-                msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan_titles)
+            if tyan:
+                msg += "\n\n🧩 Тянучки:\n" + "\n".join(f"• {t}" for t in tyan)
             else:
                 msg += "\n\n✅ Без тянучек!"
-
-            await context.bot.send_message(user_id, f"✅ Готово! Время: {readable_time}")
-            await context.bot.send_document(user_id, open(result_json_path, "rb"), caption="📗 Итоговая программа (JSON):")
-            await context.bot.send_document(user_id, open(out_path, "rb"), caption=msg)
+            await context.bot.send_message(user_id, f"✅ Готово! Время: {elapsed}")
+            await context.bot.send_document(user_id, open(js, "rb"), caption="📗 Итоговая программа (JSON):")
+            await context.bot.send_document(user_id, open(out, "rb"), caption=msg)
 
         context.application.create_task(send_final())
-        logger.info(f"✅ Завершено для @{username} за {readable_time}")
+        logger.info(f"✅ Завершено для @{username} за {elapsed}")
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для @{username}: {e}")
-        context.application.create_task(
-            context.bot.send_message(user_id, f"❌ Ошибка при обработке файла: {e}")
-        )
+        context.application.create_task(context.bot.send_message(user_id, f"❌ Ошибка: {e}"))
 
-
-# ============================================================
-# 📁 ОБРАБОТКА ДОКУМЕНТОВ
-# ============================================================
-
+# ------------------------------------------------------------
+# ОБРАБОТКА ДОКУМЕНТОВ
+# ------------------------------------------------------------
 async def handle_docx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or "unknown"
-    document = update.message.document
-    if not document.file_name.lower().endswith(".docx"):
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".docx"):
         return await update.message.reply_text("⚠️ Отправь файл в формате .docx.")
 
-    logger.info(f"📄 Получен файл {document.file_name} от @{username}")
-    file = await document.get_file()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    local_path = Path(f"data/{timestamp}__{document.file_name}")
-    await file.download_to_drive(local_path)
+    logger.info(f"📄 Получен {doc.file_name} от @{username}")
+    f = await doc.get_file()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(f"data/{ts}__{doc.file_name}")
+    await f.download_to_drive(path)
 
-    data = read_program(local_path)
-    parsed_json_path = Path(f"data/parsed_{timestamp}_{user.id}.json")
-    with open(parsed_json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    data = read_program(path)
+    parsed_json = Path(f"data/parsed_{ts}_{user.id}.json")
+    with open(parsed_json, "w", encoding="utf-8") as jf:
+        json.dump(data, jf, indent=2, ensure_ascii=False)
 
-    await update.message.reply_document(open(parsed_json_path, "rb"), caption="📘 Исходные данные после парсинга:")
-    await update.message.reply_text("📊 Начинаю генерацию программы... (можно остановить командой /stop)")
+    await update.message.reply_document(open(parsed_json, "rb"), caption="📘 Исходные данные после парсинга:")
+
+    # 🔹 Расчёт количества перестановок
+    movable = [i for i, x in enumerate(data)
+               if x.get("type") == "обычный" and 2 < i < len(data) - 2]
+    count = len(movable)
+    factorial_display = str(math.factorial(count)) if count <= 10 else f"≈ {math.factorial(10):.2e}+"
+    msg = (
+        f"📦 Файл получен!\n"
+        f"Количество номеров для перестановки — {count}.\n"
+        f"Придётся пересчитать {factorial_display} вариантов.\n"
+        f"💪 Процесс может занять несколько минут!\n\n"
+        f"🛑 Можно остановить командой /stop"
+    )
+    await update.message.reply_text(msg)
+    logger.info(f"📊 Будет просчитано {count}! вариантов (ограничено по факториалу).")
 
     thread = threading.Thread(
         target=run_generation,
-        args=(data, document, user.id, username, timestamp, context),
+        args=(data, doc, user.id, username, ts, context),
         daemon=True,
     )
     thread.start()
     logger.info(f"🚀 Поток генерации запущен (tid={thread.ident}) для @{username}")
 
-
-# ============================================================
-# 🚀 MAIN
-# ============================================================
-
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 def main():
     logger.info("🚀 Запуск Telegram-бота...")
-    start_health_server()
-    start_keep_alive()
-
+    start_health_server(); start_keep_alive()
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_docx))
-
-    logger.info("📡 Переходим в режим polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
