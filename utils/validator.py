@@ -167,8 +167,10 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
     iteration = 0
     notified_start = False
 
+    # ------------------------------------------------------------
     def backtrack(pos, confs):
         nonlocal checked, best_conf, iteration, notified_start
+        global STOP_FLAG  # 🔹 Ключевой фикс: теперь читается актуальное значение STOP_FLAG
 
         if STOP_FLAG:
             raise StopComputation
@@ -176,7 +178,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
         if confs > max_conflicts_allowed:
             return
 
-        # throttle
+        # throttling
         if iteration and iteration % SLEEP_INTERVAL == 0:
             time.sleep(SLEEP_TIME)
 
@@ -202,6 +204,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
 
         left = current[pos - 1] if pos > 0 else None
         for i in range(len(movables)):
+            global STOP_FLAG  # 🔹 Вложенная проверка — важно для рекурсивных ветвей
             if STOP_FLAG:
                 raise StopComputation
             if used[i]:
@@ -220,6 +223,7 @@ def _search_best_variants(program, max_results=5, max_conflicts_allowed=3, chat_
             current[pos] = None
 
         iteration += 1
+    # ------------------------------------------------------------
 
     # уведомление пользователю
     if chat_id and not notified_start:
