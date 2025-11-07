@@ -5,14 +5,13 @@ import os
 import json
 import time
 import asyncio
-import threading
 import logging
 from pathlib import Path
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
-from flask import Flask, jsonify
+from aiohttp import web
 
 # --- core pipeline ---
 from core.parser import parse_docx
@@ -44,7 +43,7 @@ if not BOT_TOKEN:
 
 PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
-SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", "240"))
+RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
 
 WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/stageflow"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,11 +59,7 @@ logger.info("🪵 Логирование инициализировано (че�
 # 🤖 Настройка бота
 # ============================================================
 from aiogram.client.default import DefaultBotProperties
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ============================================================
@@ -79,7 +74,6 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     await message.answer(responses.HELP_MESSAGE)
-
 
 # ============================================================
 # 📄 Основная логика обработки .docx
@@ -163,70 +157,51 @@ async def handle_docx(message: types.Message):
         await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
 
     finally:
-        # === 6️⃣ Очистка (с сохранением результатов) ===
         try:
             await cleanup_temp(user_dir, keep_results=True)
         except Exception as e:
             logger.warning(f"Не удалось очистить временные файлы: {e}")
 
+# ============================================================
+# 🌐 Webhook + healthcheck (aiohttp)
+# ============================================================
+
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"https://{RENDER_HOSTNAME}{WEBHOOK_PATH}"
+
+async def healthcheck(request):
+    return web.Response(text="OK")
+
+async def index(request):
+    return web.json_response({"app": "StageFlow v2", "status": "running"})
+
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    await bot.session.close()
+    logger.info("🛑 Webhook удалён и сессия закрыта")
+
+def create_app():
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_get("/health", healthcheck)
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    setup_application(app, dp, bot=bot)
+    return app
 
 # ============================================================
-# 🌡️ Flask healthcheck + self-ping
+# 🚀 Точка входа
 # ============================================================
-flask_app = Flask(__name__)
-
-@flask_app.get("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
-
-@flask_app.get("/")
-def index():
-    return jsonify({"app": "StageFlow v2", "status": "running"}), 200
-
-
-def _self_ping_loop(port: int, interval: int):
-    """Периодический пинг Flask, чтобы Koyeb не засыпал."""
-    import requests
-    url = f"http://127.0.0.1:{port}/health"
-    while True:
-        try:
-            r = requests.get(url, timeout=5)
-            logger.info(f"🫀 Self-ping {url} → {r.status_code}")
-        except Exception as e:
-            logger.warning(f"Self-ping error: {e}")
-        time.sleep(interval)
-
-
-def _run_flask(port: int, host: str):
-    """Поднимаем Flask в отдельном потоке."""
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    flask_app.run(host=host, port=port, debug=False, use_reloader=False)
-
-
-# ============================================================
-# 🚀 Запуск StageFlow
-# ============================================================
-async def start_bot():
-    logger.info("🤖 StageFlow Bot запущен (aiogram polling).")
-    await dp.start_polling(bot)
-
-
 def main():
-    flask_thread = threading.Thread(target=_run_flask, args=(PORT, HOST), daemon=True)
-    flask_thread.start()
-    logger.info(f"🌐 Flask healthcheck запущен на http://{HOST}:{PORT}/health")
-
-    pinger_thread = threading.Thread(target=_self_ping_loop, args=(PORT, SELF_PING_INTERVAL), daemon=True)
-    pinger_thread.start()
-    logger.info(f"🔁 Self-ping каждые {SELF_PING_INTERVAL} сек.")
-
-    try:
-        asyncio.run(start_bot())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Остановка по сигналу.")
-    except Exception as e:
-        logger.exception(f"Критическая ошибка запуска бота: {e}")
-
+    app = create_app()
+    logger.info(f"🚀 StageFlow webhook server запущен на {HOST}:{PORT}")
+    web.run_app(app, host=HOST, port=PORT)
 
 if __name__ == "__main__":
     main()
