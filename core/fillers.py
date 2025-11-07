@@ -1,6 +1,5 @@
 # core/fillers.py
 from __future__ import annotations
-import random
 import logging
 from typing import Optional
 from core.types import Block, Actor
@@ -10,7 +9,7 @@ log = logging.getLogger("stageflow.fillers")
 # ============================================================
 # 🎭 Приоритет актёров для тянучек
 # ============================================================
-FILLER_PRIORITY = ["Пушкин", "Исаев", "Рожков"]
+FILLER_PRIORITY = ["Пушкин", "Исаев"]  # Рожков исключён
 
 
 # ============================================================
@@ -54,15 +53,10 @@ def _is_actor_allowed(prev: Block, next: Block, actor_name: str) -> bool:
 def pick_filler_actor(prev: Block, next: Block, seed: int) -> Optional[str]:
     """
     Выбирает актёра для тянучки между блоками prev и next.
-    Приоритет: Пушкин → Исаев → Рожков, но порядок внутри приоритета
-    перемешивается по seed для разнообразия.
+    Приоритет: Пушкин → Исаев.
     Возвращает имя актёра или None, если никто не подходит.
     """
-    rng = random.Random(seed)
-    candidates = FILLER_PRIORITY.copy()
-    rng.shuffle(candidates)
-
-    for name in candidates:
+    for name in FILLER_PRIORITY:
         if _is_actor_allowed(prev, next, name):
             log.info(f"✅ Выбран актёр для тянучки: {name}")
             return name
@@ -79,7 +73,7 @@ if __name__ == "__main__":
         id=1,
         name="Номер 1",
         type="performance",
-        actors=[Actor("Пушкин"), Actor("Рожков", ["vo"])],
+        actors=[Actor("Пушкин"), Actor("Исаев", ["vo"])],
     )
     next = Block(
         id=2,
