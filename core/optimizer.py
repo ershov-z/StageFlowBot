@@ -162,17 +162,21 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 return
-            if need_fill and fillers_used < MAX_FILLERS:
-                actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 8))
-                if not actor_name:
+            # === изменено: строго отсекаем ветку, если filler обязателен, а лимит исчерпан
+            if need_fill:
+                if fillers_used < MAX_FILLERS:
+                    actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 8))
+                    if not actor_name:
+                        return
+                    filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
+                    next_new_id += 1
+                    assembled.append(filler_block)
+                    assembled.append(cand)
+                    dfs(pos + 1, pool, assembled, fillers_used + 1)
+                    assembled.pop()
+                    assembled.pop()
+                else:
                     return
-                filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
-                next_new_id += 1
-                assembled.append(filler_block)
-                assembled.append(cand)
-                dfs(pos + 1, pool, assembled, fillers_used + 1)
-                assembled.pop()
-                assembled.pop()
             else:
                 assembled.append(cand)
                 dfs(pos + 1, pool, assembled, fillers_used)
@@ -186,18 +190,22 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 continue
-            if need_fill and fillers_used < MAX_FILLERS:
-                actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 12))
-                if not actor_name:
+            # === изменено: строго отсекаем ветку, если filler обязателен, а лимит исчерпан
+            if need_fill:
+                if fillers_used < MAX_FILLERS:
+                    actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 12))
+                    if not actor_name:
+                        continue
+                    filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
+                    next_new_id += 1
+                    assembled.append(filler_block)
+                    assembled.append(cand)
+                    new_pool = [b for b in pool if b is not cand]
+                    dfs(pos + 1, new_pool, assembled, fillers_used + 1)
+                    assembled.pop()
+                    assembled.pop()
+                else:
                     continue
-                filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
-                next_new_id += 1
-                assembled.append(filler_block)
-                assembled.append(cand)
-                new_pool = [b for b in pool if b is not cand]
-                dfs(pos + 1, new_pool, assembled, fillers_used + 1)
-                assembled.pop()
-                assembled.pop()
             else:
                 assembled.append(cand)
                 new_pool = [b for b in pool if b is not cand]
