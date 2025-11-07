@@ -186,7 +186,8 @@ async def index(request):
 # ============================================================
 async def keep_alive():
     """Пингует /health каждые 4 минуты, чтобы Koyeb/Render не засыпал."""
-    url = f"https://{APP_URL or RENDER_HOSTNAME}/health"
+    base_url = (APP_URL or RENDER_HOSTNAME).replace("https://", "").strip().rstrip("/")
+    url = f"https://{base_url}/health"
     while True:
         await asyncio.sleep(240)
         try:
@@ -197,12 +198,13 @@ async def keep_alive():
             logger.warning(f"Auto-ping failed: {e}")
 
 # ============================================================
-# 🔧 Исправленный on_startup с задержкой
+# 🔧 Исправленный on_startup с очисткой URL
 # ============================================================
 async def on_startup(app):
     # Даём Koyeb время активировать домен
     await asyncio.sleep(10)
-    webhook_url = f"https://{APP_URL or RENDER_HOSTNAME}{WEBHOOK_PATH}"
+    base_url = (APP_URL or RENDER_HOSTNAME).replace("https://", "").strip().rstrip("/")
+    webhook_url = f"https://{base_url}{WEBHOOK_PATH}"
     logger.info(f"📡 Устанавливаю webhook → {webhook_url}")
 
     try:
