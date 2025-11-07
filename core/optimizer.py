@@ -5,6 +5,7 @@ import random
 import logging
 from typing import List, Optional, Tuple
 from copy import deepcopy
+import gc  # PERF: для ручной сборки мусора после каждого seed'а
 
 from core.types import Block, Arrangement, Actor
 from core.conflicts import strong_conflict, weak_conflict, kv_conflict
@@ -208,12 +209,14 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
     seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
     log.info(f"🧬 Seeds: {seeds}")
 
-    tasks = [stochastic_branch_and_bound(blocks, s) for s in seeds]
-    results = await asyncio.gather(*tasks)
-
+    # PERF: последовательная генерация вместо параллельной — экономим CPU/RAM на слабых инстансах.
     unique: List[Arrangement] = []
     seen_hashes = set()
-    for arr in results:
+
+    for s in seeds:
+        arr = await stochastic_branch_and_bound(blocks, s)
+
+        # Онлайновая фильтрация дублей (как раньше, но без накопления всего списка results)
         h = arrangement_hash(arr.blocks)
         if h not in seen_hashes:
             seen_hashes.add(h)
@@ -221,5 +224,9 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         else:
             log.debug(f"[DUPLICATE] вариант {arr.seed} пропущен")
 
-    log.info(f"✅ Сгенерировано уникальных вариантов: {len(unique)} / {len(results)}")
+        # Даём циклу событий подышать и просим GC освободить память от временных структур
+        await asyncio.sleep(0)
+        gc.collect()
+
+    log.info(f"✅ Сгенерировано уникальных вариантов: {len(unique)} / {len(seeds)}")
     return unique
