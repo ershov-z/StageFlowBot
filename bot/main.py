@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
 from aiohttp import web
+import aiohttp
 
 # --- core pipeline ---
 from core.parser import parse_docx
@@ -43,7 +44,10 @@ if not BOT_TOKEN:
 
 PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
-RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
+
+# Поддержка Render и Koyeb (универсально)
+APP_URL = os.getenv("APP_URL")  # например: mybot.koyeb.app
+RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", APP_URL or "localhost")
 
 WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/stageflow"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,8 +148,6 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.EXPORT_STARTED)
         template_path = saved_path
 
-        # FIX: export_variants теперь возвращает путь к ГОТОВОМУ ZIP (из export_all)
-        # и НЕ создаёт вложенный архив сам в себя. Совместимо с текущим file_manager.
         zip_path = export_variants(valid_arrangements, export_all, template_path, results_dir)
 
         await message.answer(responses.EXPORT_DONE)
@@ -179,8 +181,24 @@ async def healthcheck(request):
 async def index(request):
     return web.json_response({"app": "StageFlow v2", "status": "running"})
 
+# ============================================================
+# ♻️ Автопинг (анти-сон)
+# ============================================================
+async def keep_alive():
+    """Пингует /health каждые 4 минуты, чтобы Koyeb/Render не засыпал."""
+    url = f"https://{APP_URL or RENDER_HOSTNAME}/health"
+    while True:
+        await asyncio.sleep(240)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    logger.debug(f"Ping → {url} ({resp.status})")
+        except Exception as e:
+            logger.warning(f"Auto-ping failed: {e}")
+
 async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    app.loop.create_task(keep_alive())
     logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(app):
