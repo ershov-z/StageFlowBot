@@ -59,7 +59,12 @@ logger.info("🪵 Логирование инициализировано (че�
 # ============================================================
 # 🤖 Настройка бота
 # ============================================================
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 # ============================================================
