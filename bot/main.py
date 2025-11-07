@@ -196,10 +196,22 @@ async def keep_alive():
         except Exception as e:
             logger.warning(f"Auto-ping failed: {e}")
 
+# ============================================================
+# 🔧 Исправленный on_startup с задержкой
+# ============================================================
 async def on_startup(app):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    # Даём Koyeb время активировать домен
+    await asyncio.sleep(10)
+    webhook_url = f"https://{APP_URL or RENDER_HOSTNAME}{WEBHOOK_PATH}"
+    logger.info(f"📡 Устанавливаю webhook → {webhook_url}")
+
+    try:
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+        logger.info(f"🌐 Webhook установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при установке webhook: {e}")
+
     app.loop.create_task(keep_alive())
-    logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
