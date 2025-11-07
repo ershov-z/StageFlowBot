@@ -201,7 +201,7 @@ async def keep_alive():
 # 🔧 Исправленный on_startup с очисткой URL
 # ============================================================
 async def on_startup(app):
-    # Даём Koyeb время активировать домен
+    # Даём Koyeb/Render время активировать домен
     await asyncio.sleep(10)
     base_url = (APP_URL or RENDER_HOSTNAME).replace("https://", "").strip().rstrip("/")
     webhook_url = f"https://{base_url}{WEBHOOK_PATH}"
@@ -213,12 +213,15 @@ async def on_startup(app):
     except Exception as e:
         logger.error(f"❌ Ошибка при установке webhook: {e}")
 
-    app.loop.create_task(keep_alive())
+    # ✅ заменено: app.loop.create_task(...) → asyncio.create_task(...)
+    asyncio.create_task(keep_alive())
 
 async def on_shutdown(app):
-    await bot.delete_webhook()
-    await bot.session.close()
-    logger.info("🛑 Webhook удалён и сессия закрыта")
+    # ❗ Не удаляем вебхук на проде, чтобы бот продолжал принимать обновления
+    try:
+        await bot.session.close()
+    finally:
+        logger.info("🛑 Завершение без удаления webhook (сессия закрыта)")
 
 def create_app():
     app = web.Application()
