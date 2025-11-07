@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
@@ -43,6 +44,20 @@ class Block:
     fixed: bool = False
     meta: Optional[dict] = None
 
+    # --- новые поля для «v1-стиля» ---
+    num: str = ""                # колонка № (нумерация)
+    actors_raw: str = ""         # исходная строка «Актеры»
+    pp_raw: str = ""             # исходная строка «ПП»
+    hire: str = ""               # колонка «Найм»
+    responsible: str = ""        # колонка «Ответственный»
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def short(self) -> str:
+        """Короткое описание блока для логов."""
+        return f"[{self.id}:{self.type}] {self.name}"
+
     def actor_names(self) -> List[str]:
         """Возвращает список имён актёров (без дубликатов)."""
         return list({a.name for a in self.actors})
@@ -58,10 +73,22 @@ class Block:
 
 @dataclass
 class Program:
-    """
-    Вся программа концерта, состоящая из блоков.
-    """
+    """Вся программа концерта, состоящая из блоков."""
     blocks: List[Block] = field(default_factory=list)
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __iter__(self):
+        return iter(self.blocks)
+
+    def get_performances(self) -> List[Block]:
+        """Возвращает только номера (type=performance)."""
+        return [b for b in self.blocks if b.type == "performance"]
+
+    def get_fillers(self) -> List[Block]:
+        """Возвращает только тянучки."""
+        return [b for b in self.blocks if b.type == "filler"]
 
     def get_actor_occurrences(self, name: str) -> List[int]:
         """Возвращает индексы блоков, где участвует указанный актёр."""
@@ -71,12 +98,6 @@ class Program:
                 indices.append(block.id)
         return indices
 
-    def __len__(self):
-        return len(self.blocks)
-
-    def __iter__(self):
-        return iter(self.blocks)
-
 
 # ============================================================
 # 🧩 Результирующая перестановка
@@ -85,12 +106,17 @@ class Program:
 @dataclass
 class Arrangement:
     """Готовая перестроенная программа."""
-    blocks: List[Block]
     seed: int
-    score: float = 0.0
-    fillers_count: int = 0
+    blocks: List[Block] = field(default_factory=list)
+    fillers_used: int = 0
     strong_conflicts: int = 0
     weak_conflicts: int = 0
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __iter__(self):
+        return iter(self.blocks)
 
 
 # ============================================================

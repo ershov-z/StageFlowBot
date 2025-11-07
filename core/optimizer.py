@@ -1,13 +1,12 @@
 # core/optimizer.py
 from __future__ import annotations
-
-import logging
-import random
-from dataclasses import replace
-from typing import List, Optional, Tuple
 import asyncio
+import random
+import logging
+from typing import List, Optional, Tuple
+from copy import deepcopy
 
-from core.types import Block, Actor
+from core.types import Block, Arrangement, Actor
 from core.conflicts import strong_conflict, weak_conflict, kv_conflict
 from core.fillers import pick_filler_actor
 from service.hash_utils import arrangement_hash, is_duplicate, register_hash
@@ -15,74 +14,90 @@ from service.timing import measure_time
 
 log = logging.getLogger("stageflow.optimizer")
 
+MAX_FILLERS = 3
+MAX_VARIANTS = 5
+
 
 # ============================================================
 # 🧩 Вспомогательные функции
 # ============================================================
 
+def _copy_block(block: Block) -> Block:
+    """Полное копирование блока (включая raw-поля)."""
+    return Block(
+        id=block.id,
+        name=block.name,
+        type=block.type,
+        actors=[Actor(a.name, list(a.tags)) for a in block.actors],
+        kv=block.kv,
+        fixed=block.fixed,
+        meta=deepcopy(block.meta) if block.meta else None,
+        num=block.num,
+        actors_raw=block.actors_raw,
+        pp_raw=block.pp_raw,
+        hire=block.hire,
+        responsible=block.responsible,
+    )
+
+
+def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
+    """Создаёт filler-блок с заполненными полями (v1-style)."""
+    actor = Actor(actor_name)
+    return Block(
+        id=next_id,
+        name=f"[filler] {actor_name}",
+        type="filler",
+        actors=[actor],
+        kv=False,
+        fixed=False,
+        num="",
+        actors_raw=actor_name,
+        pp_raw="",
+        hire="",
+        responsible="",
+        meta={"auto": True, "between": (prev.name, nxt.name)},
+    )
+
+
+def _needs_filler(prev_perf: Optional[Block], cand: Block) -> Tuple[bool, bool]:
+    """
+    Проверяет соседство двух performance-блоков.
+    Возвращает (запретить, нужен_филлер).
+    """
+    if prev_perf is None or cand.type != "performance":
+        return (False, False)
+    if strong_conflict(prev_perf, cand) or kv_conflict(prev_perf, cand):
+        return (True, False)
+    if weak_conflict(prev_perf, cand):
+        return (False, True)
+    return (False, False)
+
+
 def _last_performance(seq: List[Block]) -> Optional[Block]:
-    """Возвращает последний performance-блок в уже собранной части программы."""
     for b in reversed(seq):
         if b.type == "performance":
             return b
     return None
 
 
-def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
-    """Создаёт filler-блок с выбранным актёром."""
-    return Block(
-        id=next_id,
-        name=f"[filler] {actor_name}",
-        type="filler",
-        actors=[Actor(actor_name)],
-        kv=False,
-        fixed=False,
-    )
-
-
-def _needs_filler(prev_perf: Block, cand: Block) -> Tuple[bool, bool]:
-    """
-    Проверяет пару соседних performance-блоков.
-    Возвращает кортеж (запретить, нужен_филлер):
-      - запретить=True, если сильный конфликт или kv-соседство => нельзя ставить cand после prev_perf
-      - нужен_филлер=True, если слабый конфликт => можно решить тянучкой
-    """
-    if prev_perf is None or cand.type != "performance":
-        return (False, False)
-
-    if strong_conflict(prev_perf, cand):
-        return (True, False)
-    if kv_conflict(prev_perf, cand):
-        return (True, False)
-
-    if weak_conflict(prev_perf, cand):
-        return (False, True)
-
-    return (False, False)
-
-
 # ============================================================
-# 🎛️ Основной стохастический backtracking с отсечением
+# 🎛️ Основной стохастический backtracking
 # ============================================================
 
 @measure_time("optimizer.stochastic_branch_and_bound")
-async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> List[Block]:
+async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
     """
-    Собирает один лучший вариант программы для заданного seed.
-    - Фиксированные блоки (fixed=True) не переставляются.
-    - Нефиксированные performance-блоки переставляются.
-    - Сильные конфликты недопустимы.
-    - Слабые конфликты разрешаются тянучками (до 3 шт) через pick_filler_actor.
-    - Цель — минимизировать количество тянучек.
+    Собирает один вариант программы для заданного seed.
+    Фиксированные блоки остаются на своих местах,
+    переставляются только performance.
     """
     rng = random.Random(seed)
     seen_hashes: set[str] = set()
 
-    base_seq: List[Block] = [b for b in blocks if b.type != "filler"]
-
+    # Рабочая копия блоков
+    base_seq: List[Block] = [_copy_block(b) for b in blocks if b.type != "filler"]
     fixed_positions = {i for i, b in enumerate(base_seq) if b.fixed}
     fixed_at_index = {i: base_seq[i] for i in fixed_positions}
-
     variable_pool: List[Block] = [b for b in base_seq if not b.fixed]
 
     max_id = max((b.id for b in blocks), default=0)
@@ -94,24 +109,10 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> List[Bl
 
     rng.shuffle(variable_pool)
 
-    # --------------------------------------------------------
-    # Рекурсивная сборка
-    # --------------------------------------------------------
-    def dfs(pos: int,
-            pool: List[Block],
-            assembled: List[Block],
-            fillers_used: int) -> None:
+    def dfs(pos: int, pool: List[Block], assembled: List[Block], fillers_used: int) -> None:
         nonlocal best_arrangement, best_fillers_used, found_perfect, next_new_id
-
-        # Отсечение по количеству тянучек
-        if fillers_used >= best_fillers_used:
+        if fillers_used >= best_fillers_used or fillers_used > MAX_FILLERS or found_perfect:
             return
-        if fillers_used > 3:
-            return
-        if found_perfect:
-            return
-
-        # База: собрали весь каркас
         if pos == len(base_seq):
             candidate = assembled.copy()
             h = arrangement_hash(candidate)
@@ -122,23 +123,17 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> List[Bl
                 log.info(f"[RESULT] seed={seed} | fillers={fillers_used} | hash={h[:8]}")
                 if best_fillers_used == 0:
                     found_perfect = True
-            else:
-                log.debug(f"[DUPLICATE] seed={seed} вариант уже встречался ({h[:8]})")
             return
 
-        # Фиксированные позиции
         if pos in fixed_positions:
             cand = fixed_at_index[pos]
             prev_perf = _last_performance(assembled)
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 return
-
-            if need_fill:
-                if fillers_used >= 3:
-                    return
+            if need_fill and fillers_used < MAX_FILLERS:
                 actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 8))
-                if actor_name is None:
+                if not actor_name:
                     return
                 filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
                 next_new_id += 1
@@ -153,21 +148,16 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> List[Bl
                 assembled.pop()
             return
 
-        # Нефиксированные
         try_order = pool.copy()
         rng.shuffle(try_order)
-
         for cand in try_order:
             prev_perf = _last_performance(assembled)
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 continue
-
-            if need_fill:
-                if fillers_used >= 3:
-                    continue
+            if need_fill and fillers_used < MAX_FILLERS:
                 actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 12))
-                if actor_name is None:
+                if not actor_name:
                     continue
                 filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
                 next_new_id += 1
@@ -182,27 +172,54 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> List[Bl
                 new_pool = [b for b in pool if b is not cand]
                 dfs(pos + 1, new_pool, assembled, fillers_used)
                 assembled.pop()
-
             if found_perfect:
                 return
 
-    # --------------------------------------------------------
-    # Старт
-    # --------------------------------------------------------
     log.info(f"▶️ Start BnB (seed={seed}) | fixed={len(fixed_positions)} | variable={len(variable_pool)}")
-    dfs(pos=0, pool=variable_pool, assembled=[], fillers_used=0)
+    dfs(0, variable_pool, [], 0)
 
     if best_arrangement is None:
         log.warning(f"⚠️ Не удалось собрать вариант для seed={seed}. Возвращаю исходный порядок.")
-        return blocks
+        return Arrangement(seed=seed, blocks=blocks, fillers_used=0)
 
-    # Финальная проверка на сильные конфликты
-    for i in range(len(best_arrangement) - 1):
-        a, b = best_arrangement[i], best_arrangement[i + 1]
-        if a.type == "performance" and b.type == "performance":
-            if strong_conflict(a, b) or kv_conflict(a, b):
-                log.error(f"❌ Post-check strong/kv conflict between '{a.name}' and '{b.name}'")
-                break
+    # Финальная проверка конфликтов
+    strong_cnt = sum(strong_conflict(best_arrangement[i], best_arrangement[i + 1])
+                     for i in range(len(best_arrangement) - 1))
+    weak_cnt = sum(weak_conflict(best_arrangement[i], best_arrangement[i + 1])
+                   for i in range(len(best_arrangement) - 1))
 
-    log.info(f"✅ Done (seed={seed}) | fillers={best_fillers_used} | total_blocks={len(best_arrangement)}")
-    return best_arrangement
+    log.info(f"✅ Done (seed={seed}) | fillers={best_fillers_used} | total={len(best_arrangement)}")
+    return Arrangement(
+        seed=seed,
+        blocks=best_arrangement,
+        fillers_used=best_fillers_used,
+        strong_conflicts=strong_cnt,
+        weak_conflicts=weak_cnt,
+    )
+
+
+# ============================================================
+# 🧮 Генерация нескольких вариантов
+# ============================================================
+
+@measure_time("optimizer.generate_arrangements")
+async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
+    """Создаёт до 5 вариантов перестроенной программы."""
+    seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
+    log.info(f"🧬 Seeds: {seeds}")
+
+    tasks = [stochastic_branch_and_bound(blocks, s) for s in seeds]
+    results = await asyncio.gather(*tasks)
+
+    unique: List[Arrangement] = []
+    seen_hashes = set()
+    for arr in results:
+        h = arrangement_hash(arr.blocks)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            unique.append(arr)
+        else:
+            log.debug(f"[DUPLICATE] вариант {arr.seed} пропущен")
+
+    log.info(f"✅ Сгенерировано уникальных вариантов: {len(unique)} / {len(results)}")
+    return unique

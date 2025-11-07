@@ -1,191 +1,227 @@
-import asyncio
-import logging
+# bot/main.py
+from __future__ import annotations
+
 import os
 import json
-import uuid
-import tempfile
-from io import BytesIO
-from pathlib import Path
+import time
+import asyncio
 import threading
-import requests
-from flask import Flask
-
+import logging
+from pathlib import Path
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.types import BufferedInputFile
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
+from flask import Flask, jsonify
 
-from bot import file_manager, responses
+# --- core pipeline ---
 from core.parser import parse_docx
-from core.optimizer import stochastic_branch_and_bound
+from core.optimizer import generate_arrangements
 from core.validator import validate_arrangement
-from service.seeds import generate_seeds
+from core.exporter import export_all
 
-# === Инициализация бота ===
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN not found in environment variables")
-
-bot = Bot(
-    token=TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+# --- bot utils ---
+from bot import responses
+from bot.file_manager import (
+    save_uploaded_file,
+    cleanup_temp,
+    get_user_dir,
+    get_results_dir,
+    save_json,
+    export_variants,
 )
-dp = Dispatcher(storage=MemoryStorage())
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("stageflow.main")
+# --- service utils ---
+from service.logger import setup_logger
 
-# === Flask healthcheck ===
-app = Flask(__name__)
+# ============================================================
+# ⚙️ Конфигурация
+# ============================================================
 
-@app.route("/health")
-def health():
-    return {"status": "ok"}, 200
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    print("⚠️  BOT_TOKEN не задан — установите переменную окружения BOT_TOKEN")
 
+PORT = int(os.getenv("PORT", "8080"))
+HOST = os.getenv("HOST", "0.0.0.0")
+SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", "240"))
 
-def start_flask():
-    """Запускает Flask сервер в отдельном потоке."""
-    port = int(os.getenv("PORT", 8080))
-    threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
-        daemon=True
-    ).start()
-    logger.info(f"🌐 Flask healthcheck сервер запущен на порту {port}")
+WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/stageflow"))
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================================
+# 🪵 Логирование
+# ============================================================
+logger = setup_logger("stageflow.main")
+logger.info("🪵 Логирование инициализировано. Файл: /tmp/logs/stageflow.log")
 
-# === Авто-пинг приложения каждые 2 минуты ===
-async def self_ping_loop():
-    app_url = os.getenv("APP_URL")
-    if not app_url:
-        logger.warning("⚠️ APP_URL не задан, пинг отключён.")
-        return
-    while True:
-        try:
-            requests.get(app_url + "/health", timeout=10)
-            logger.info("🔁 Self-ping → /health OK")
-        except Exception as e:
-            logger.warning(f"⚠️ Self-ping error: {e}")
-        await asyncio.sleep(120)
+# ============================================================
+# 🤖 Настройка бота
+# ============================================================
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
 
-# === Обработчики ===
-@dp.message(CommandStart())
-async def start_command(message: types.Message):
-    await message.answer(responses.start_message())
+# ============================================================
+# 🧭 Команды
+# ============================================================
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(responses.START_MESSAGE)
 
 
-@dp.message(Command(commands=["help"]))
-async def help_command(message: types.Message):
-    await message.answer(responses.help_message())
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(responses.HELP_MESSAGE)
 
 
-@dp.message(lambda msg: msg.document and msg.document.file_name.endswith(".docx"))
+# ============================================================
+# 📄 Основная логика обработки .docx
+# ============================================================
+
+@dp.message(lambda m: m.document and m.document.file_name.lower().endswith(".docx"))
 async def handle_docx(message: types.Message):
+    user_id = message.from_user.id
     document = message.document
-    file_name = document.file_name
-    logger.info(f"📄 Получен файл: {file_name}")
-    await message.answer(responses.processing_message())
+
+    await message.answer(responses.FILE_RECEIVED.format(name=document.file_name))
+    await message.answer(responses.PARSING_STARTED)
+
+    user_dir = get_user_dir(WORK_DIR, user_id)
+    results_dir = get_results_dir(user_dir)
 
     try:
-        # === 1. Скачиваем файл ===
-        file_path = await file_manager.download_docx(bot, document)
-        logger.info(f"✅ Файл сохранён: {file_path}")
+        # === 1️⃣ Сохраняем исходный файл ===
+        saved_path = await save_uploaded_file(bot, document, user_dir)
+        logger.info(f"📥 Получен файл: {saved_path}")
 
-        # === 2. Парсим документ ===
-        program = parse_docx(file_path)
-        blocks = program.blocks
-        logger.info(f"📊 Извлечено блоков: {len(blocks)}")
+        # === 2️⃣ Парсим документ ===
+        program = parse_docx(str(saved_path))
+        parsed_json_path = user_dir / f"parsed_{time.strftime('%H%M%S')}.json"
 
-        # 💾 Сохраняем parsed.json
-        parsed_path = Path(tempfile.gettempdir()) / f"parsed_{uuid.uuid4().hex[:6]}.json"
-        with open(parsed_path, "w", encoding="utf-8") as f:
-            json.dump(
-                [
-                    {
-                        "id": b.id,
-                        "name": b.name,
-                        "type": b.type,
-                        "kv": b.kv,
-                        "fixed": b.fixed,
-                        "actors": [{"name": a.name, "tags": a.tags} for a in b.actors],
-                    }
-                    for b in blocks
-                ],
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-        logger.info(f"💾 Сохранён parsed.json: {parsed_path}")
+        parsed_payload = [
+            {
+                "id": b.id,
+                "name": b.name,
+                "type": b.type,
+                "kv": b.kv,
+                "fixed": b.fixed,
+                "num": b.num,
+                "actors_raw": b.actors_raw,
+                "pp_raw": b.pp_raw,
+                "hire": b.hire,
+                "responsible": b.responsible,
+                "actors": [{"name": a.name, "tags": list(a.tags)} for a in b.actors],
+            }
+            for b in program.blocks
+        ]
+        await save_json(parsed_payload, parsed_json_path)
+        await message.answer(responses.PARSING_DONE)
+        await message.answer_document(
+            FSInputFile(parsed_json_path),
+            caption="🧾 Распарсенный JSON (исходная таблица).",
+        )
 
-        # 📤 Отправляем parsed.json пользователю
-        try:
-            with open(parsed_path, "rb") as f:
-                json_bytes = f.read()
-            json_file = BufferedInputFile(json_bytes, filename="parsed.json")
-            await message.answer_document(
-                document=json_file,
-                caption="📄 Вот как я распознал программу из твоего файла."
-            )
-            await asyncio.sleep(1)  # ждём отправку
-            logger.info("📤 parsed.json отправлен пользователю.")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось отправить parsed.json: {e}")
+        # === 3️⃣ Генерация вариантов ===
+        await message.answer(responses.OPTIMIZATION_STARTED)
+        arrangements = await generate_arrangements(program.blocks)
+        arrangements_json = user_dir / f"arrangements_{time.strftime('%H%M%S')}.json"
+        await save_json([a.seed for a in arrangements], arrangements_json)
+        await message.answer(responses.OPTIMIZATION_DONE.format(count=len(arrangements)))
 
-        # === 3. Генерируем варианты ===
-        seeds = generate_seeds(5)
-        arrangements = []
-        for seed in seeds:
-            arranged = await stochastic_branch_and_bound(blocks, seed)
-            if validate_arrangement(arranged):
-                arrangements.append(
-                    type("Arrangement", (), {"blocks": arranged, "seed": seed})
-                )
+        # === 4️⃣ Валидация ===
+        await message.answer(responses.VALIDATION_STARTED)
+        valid_arrangements = [a for a in arrangements if validate_arrangement(a.blocks)]
+        valid_json = user_dir / f"validated_{time.strftime('%H%M%S')}.json"
+        await save_json([a.seed for a in valid_arrangements], valid_json)
+        await message.answer(responses.VALIDATION_DONE.format(count=len(valid_arrangements)))
 
-        if not arrangements:
-            await message.answer(responses.validation_failed_message())
-            return
+        if not valid_arrangements:
+            await message.answer("⚠️ Не найдено валидных вариантов. Использую лучший найденный.")
+            valid_arrangements = arrangements[:1]
 
-        # === 4. Экспортируем ===
-        template_path = Path(file_path)
-        zip_buffer = await file_manager.export_variants(arrangements, template_path)
+        # === 5️⃣ Экспорт и упаковка ===
+        await message.answer(responses.EXPORT_STARTED)
+        template_path = saved_path
+        zip_path = export_variants(valid_arrangements, export_all, template_path, results_dir)
+        await message.answer(responses.EXPORT_DONE)
+        await message.answer(responses.ARCHIVE_DONE)
+        await message.answer_document(FSInputFile(zip_path), caption="📦 StageFlow — результаты работы")
 
-        # === 5. Добавляем parsed.json в архив ===
-        with open(parsed_path, "rb") as f:
-            parsed_bytes = f.read()
-
-        final_zip = BytesIO()
-        import zipfile
-        zip_buffer.seek(0)
-        with zipfile.ZipFile(zip_buffer, "r") as src_zip, zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED) as dst_zip:
-            for item in src_zip.infolist():
-                dst_zip.writestr(item, src_zip.read(item.filename))
-            dst_zip.writestr("parsed.json", parsed_bytes)
-        final_zip.seek(0)
-
-        # === 6. Отправляем архив ===
-        result_file = BufferedInputFile(final_zip.getvalue(), filename="StageFlow_Results.zip")
-        await message.answer_document(document=result_file, caption=responses.success_message())
+        await message.answer(responses.DONE)
 
     except Exception as e:
-        logger.exception("❌ Ошибка при обработке файла")
-        await message.answer(responses.internal_error_message())
-        await message.answer(f"<code>{e}</code>")
+        logger.exception(f"Ошибка при обработке: {e}")
+        error_path = user_dir / f"error_{time.strftime('%H%M%S')}.json"
+        await save_json({"error": str(e)}, error_path)
+        await message.answer(responses.ERROR_MESSAGE.format(error=e))
+        await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
+    finally:
+        # === 6️⃣ Очистка (сохранить результаты) ===
+        try:
+            await cleanup_temp(user_dir, keep_results=True)
+        except Exception as e:
+            logger.warning(f"Не удалось очистить временные файлы: {e}")
 
 
-@dp.message()
-async def fallback(message: types.Message):
-    await message.answer(responses.unknown_message())
+# ============================================================
+# 🌡️ Flask healthcheck + self-ping
+# ============================================================
+flask_app = Flask(__name__)
+
+@flask_app.get("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@flask_app.get("/")
+def index():
+    return jsonify({"app": "StageFlow v2", "status": "running"}), 200
 
 
-# === Главная точка входа ===
-async def main():
-    logger.info("🤖 StageFlow Bot запущен.")
-    start_flask()
-    asyncio.create_task(self_ping_loop())
+def _self_ping_loop(port: int, interval: int):
+    """Периодический пинг Flask, чтобы Koyeb не засыпал."""
+    import requests
+    url = f"http://127.0.0.1:{port}/health"
+    while True:
+        try:
+            r = requests.get(url, timeout=5)
+            logger.info(f"🫀 Self-ping {url} → {r.status_code}")
+        except Exception as e:
+            logger.warning(f"Self-ping error: {e}")
+        time.sleep(interval)
+
+
+def _run_flask(port: int, host: str):
+    """Поднимаем Flask в отдельном потоке."""
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    flask_app.run(host=host, port=port, debug=False, use_reloader=False)
+
+
+# ============================================================
+# 🚀 Запуск StageFlow
+# ============================================================
+async def start_bot():
+    logger.info("🤖 StageFlow Bot запущен (aiogram polling).")
     await dp.start_polling(bot)
 
 
+def main():
+    flask_thread = threading.Thread(target=_run_flask, args=(PORT, HOST), daemon=True)
+    flask_thread.start()
+    logger.info(f"🌐 Flask healthcheck запущен на http://{HOST}:{PORT}/health")
+
+    pinger_thread = threading.Thread(target=_self_ping_loop, args=(PORT, SELF_PING_INTERVAL), daemon=True)
+    pinger_thread.start()
+    logger.info(f"🔁 Self-ping каждые {SELF_PING_INTERVAL} сек.")
+
+    try:
+        asyncio.run(start_bot())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("🛑 Остановка по сигналу.")
+    except Exception as e:
+        logger.exception(f"Критическая ошибка запуска бота: {e}")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

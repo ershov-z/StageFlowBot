@@ -37,17 +37,14 @@ def _is_actor_allowed(prev: Block, next: Block, actor_name: str) -> bool:
     - актёр есть в предыдущем номере с тегом gk
     - актёр есть в следующем номере без тега later
     """
-    # 1. Актёр есть в следующем номере с gk → нельзя
     if _has_actor_with_tag(next, actor_name, "gk"):
         log.debug(f"🚫 {actor_name}: gk в следующем блоке ({next.name})")
         return False
 
-    # 2. Актёр есть в предыдущем номере с gk → нельзя
     if _has_actor_with_tag(prev, actor_name, "gk"):
         log.debug(f"🚫 {actor_name}: gk в предыдущем блоке ({prev.name})")
         return False
 
-    # 3. Актёр есть в следующем номере, но без later → нельзя
     if _actor_in_block(next, actor_name) and not _has_actor_with_tag(next, actor_name, "later"):
         log.debug(f"🚫 {actor_name}: в следующем блоке без 'later' ({next.name})")
         return False
@@ -82,19 +79,16 @@ def pick_filler_actor(prev: Block, next: Block, seed: int) -> Optional[str]:
 # 🧪 Тест (локальный)
 # ============================================================
 if __name__ == "__main__":
-    from core.types import Actor
-
     prev = Block(
         id=1,
         name="Номер 1",
         type="performance",
-        actors=[Actor("Пушкин"), Actor("Рожков", {"gk"})],
+        actors=[Actor("Пушкин"), Actor("Рожков", ["gk"])],
     )
     next = Block(
         id=2,
         name="Номер 2",
         type="performance",
-        actors=[Actor("Исаев", {"later"}), Actor("Пушкин")],
+        actors=[Actor("Исаев", ["later"]), Actor("Пушкин")],
     )
-
     print(pick_filler_actor(prev, next, seed=42))

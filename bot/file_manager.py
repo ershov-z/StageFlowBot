@@ -1,137 +1,157 @@
-# stageflow_v2/bot/file_manager.py
+# bot/file_manager.py
+from __future__ import annotations
 import os
-import io
-import uuid
-import tempfile
-import logging
+import json
+import shutil
+import aiofiles
 import zipfile
-import asyncio
-import time
+from datetime import datetime
 from pathlib import Path
-from aiogram import Bot
-from aiogram.types import Document
-from aiofiles import open as aio_open
+from aiogram import Bot, types
 
-from core.exporter import export_all
 from service.logger import get_logger
 
-log = get_logger("stageflow.file_manager")
+logger = get_logger(__name__)
 
-# ----------------------------------------------------
-# 🔧 Временные директории
-# ----------------------------------------------------
-BASE_TMP = tempfile.gettempdir()
-DOWNLOAD_DIR = os.path.join(BASE_TMP, "stageflow_downloads")
-RESULTS_DIR = os.path.join(BASE_TMP, "stageflow_results")
+# ============================================================
+# 🧭 Вспомогательные функции путей
+# ============================================================
 
-
-# ----------------------------------------------------
-# 📁 Создание директорий
-# ----------------------------------------------------
-async def ensure_dirs() -> None:
-    """Создаёт временные директории, если их нет."""
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+def get_user_dir(base: Path, user_id: int) -> Path:
+    """Возвращает путь каталога пользователя."""
+    d = base / f"user_{user_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-# ----------------------------------------------------
-# 📥 Загрузка .docx
-# ----------------------------------------------------
-async def download_docx(bot: Bot, document: Document) -> str:
-    """Скачивает docx-файл, присланный пользователем, во временную директорию."""
-    await ensure_dirs()
+def get_results_dir(user_dir: Path) -> Path:
+    """Возвращает каталог результатов и создаёт его при необходимости."""
+    d = user_dir / "results"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def timestamp() -> str:
+    """Строка-время для имён файлов."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# ============================================================
+# 📥 Приём и сохранение исходного файла
+# ============================================================
+
+async def save_uploaded_file(bot: Bot, document: types.Document, user_dir: Path) -> Path:
+    """
+    Сохраняет .docx из Telegram в каталог пользователя.
+    Возвращает путь к сохранённому файлу.
+    """
+    user_dir.mkdir(parents=True, exist_ok=True)
+    filename = document.file_name or f"input_{timestamp()}.docx"
+    dest_path = user_dir / filename
+
+    logger.info(f"📥 Скачиваю файл {filename} …")
     file_info = await bot.get_file(document.file_id)
+    stream = await bot.download_file(file_info.file_path)
 
-    unique_name = f"{uuid.uuid4()}_{document.file_name}"
-    local_path = os.path.join(DOWNLOAD_DIR, unique_name)
+    async with aiofiles.open(dest_path, "wb") as f:
+        await f.write(stream.read())
 
-    try:
-        file_data = await bot.download_file(file_info.file_path)
-        data = file_data.read()
-        async with aio_open(local_path, "wb") as f:
-            await f.write(data)
-        log.info(f"📂 Файл сохранён: {local_path}")
-        return local_path
-    except Exception as e:
-        log.exception(f"Ошибка при загрузке файла {document.file_name}: {e}")
-        raise
+    logger.info(f"📂 Файл сохранён: {dest_path}")
+    return dest_path
 
 
-# ----------------------------------------------------
-# 🧹 Очистка временных файлов
-# ----------------------------------------------------
-async def cleanup_old_files(hours: int = 2) -> None:
-    """Удаляет временные файлы старше указанного количества часов."""
-    await ensure_dirs()
-    cutoff = time.time() - hours * 3600
+# ============================================================
+# 💾 Сохранение промежуточных данных
+# ============================================================
 
-    for folder in (DOWNLOAD_DIR, RESULTS_DIR):
-        for filename in os.listdir(folder):
-            path = os.path.join(folder, filename)
-            try:
-                stat = os.stat(path)
-                if stat.st_mtime < cutoff:
-                    os.remove(path)
-                    log.debug(f"🧹 Удалён старый файл: {path}")
-            except Exception as e:
-                log.warning(f"Не удалось удалить {path}: {e}")
+async def save_json(data, path: Path):
+    """Асинхронно сохраняет объект как JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    async with aiofiles.open(path, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+    logger.debug(f"💾 JSON сохранён: {path.name}")
 
 
-# ----------------------------------------------------
-# 🧩 Экспорт и упаковка вариантов
-# ----------------------------------------------------
-async def export_variants(arrangements, template_path: Path) -> io.BytesIO:
-    """Экспортирует 5 вариантов программы и возвращает ZIP-буфер."""
-    await ensure_dirs()
-
-    try:
-        export_dir = Path(RESULTS_DIR) / f"export_{uuid.uuid4().hex[:8]}"
-        export_dir.mkdir(parents=True, exist_ok=True)
-
-        log.info(f"🧾 Начало экспорта пяти вариантов → {export_dir}")
-
-        zip_path = export_all(arrangements, template_path, export_dir)
-
-        # Читаем ZIP в память для отправки
-        with open(zip_path, "rb") as f:
-            buffer = io.BytesIO(f.read())
-        buffer.seek(0)
-        os.remove(zip_path)  # очистка после упаковки
-
-        log.info(f"📦 Готов ZIP для отправки: {zip_path}")
-        return buffer
-
-    except Exception as e:
-        log.exception(f"Ошибка при экспорте вариантов: {e}")
-        raise
+def save_sync_json(data, path: Path):
+    """Синхронная версия сохранения JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.debug(f"💾 JSON сохранён (sync): {path.name}")
 
 
-# ----------------------------------------------------
-# 📦 Ручная архивация (для тестов)
-# ----------------------------------------------------
-async def zip_results(file_paths: list[str], zip_name: str = "StageFlow_Results.zip") -> io.BytesIO:
-    """Упаковывает список файлов в ZIP и возвращает буфер BytesIO."""
-    buffer = io.BytesIO()
-    try:
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for path in file_paths:
-                arcname = os.path.basename(path)
-                zipf.write(path, arcname=arcname)
-        buffer.seek(0)
-        log.info(f"📦 Упаковано {len(file_paths)} файлов в архив {zip_name}")
-        return buffer
-    except Exception as e:
-        log.exception(f"Ошибка при упаковке ZIP: {e}")
-        raise
+# ============================================================
+# 📦 Экспорт и упаковка результатов
+# ============================================================
+
+def copy_export_files(src_dir: Path, dst_dir: Path):
+    """
+    Копирует все файлы результатов (docx/json) в папку результатов пользователя.
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for f in src_dir.glob("*"):
+        if f.is_file():
+            shutil.copy2(f, dst_dir / f.name)
+            logger.debug(f"📎 Скопирован: {f.name}")
 
 
-# ----------------------------------------------------
-# 🧰 Утилита для CLI и тестов
-# ----------------------------------------------------
-def get_temp_paths() -> dict:
-    """Возвращает текущие пути временных директорий."""
-    return {
-        "downloads": DOWNLOAD_DIR,
-        "results": RESULTS_DIR,
-        "base_tmp": BASE_TMP,
-    }
+def make_zip(export_dir: Path, archive_path: Path) -> Path:
+    """Создаёт архив ZIP из всех файлов export_dir."""
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file in export_dir.glob("*"):
+            if file.is_file():
+                zipf.write(file, arcname=file.name)
+                logger.debug(f"📦 Добавлен: {file.name}")
+    logger.info(f"🎁 Архив создан: {archive_path}")
+    return archive_path
+
+
+def export_variants(arrangements, exporter_func, template_path: Path, results_dir: Path) -> Path:
+    """
+    Экспортирует все варианты с помощью exporter_func (export_all) и возвращает путь к ZIP.
+    """
+    zip_path = results_dir / f"StageFlow_Results_{timestamp()}.zip"
+    exporter_func(arrangements, template_path, results_dir)
+    make_zip(results_dir, zip_path)
+    logger.info(f"📦 Экспорт завершён. Архив: {zip_path}")
+    return zip_path
+
+
+# ============================================================
+# 🧹 Очистка временных директорий
+# ============================================================
+
+async def cleanup_temp(user_dir: Path, keep_results: bool = True):
+    """
+    Удаляет все временные файлы пользователя.
+    Если keep_results=True, папка results/ сохраняется.
+    """
+    if not user_dir.exists():
+        return
+
+    for item in user_dir.iterdir():
+        try:
+            if keep_results and item.is_dir() and item.name == "results":
+                continue
+            if item.is_file():
+                item.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(item, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка очистки {item}: {e}")
+
+    logger.info(f"🧹 Очистка завершена: {user_dir}")
+
+
+# ============================================================
+# 🧪 Локальный тест (CLI)
+# ============================================================
+
+if __name__ == "__main__":
+    base = Path("/tmp/stageflow_test")
+    user = get_user_dir(base, 123)
+    res = get_results_dir(user)
+    print("Создан:", res)
+    make_zip(res, res / "dummy.zip")
+    print("ZIP готов.")
