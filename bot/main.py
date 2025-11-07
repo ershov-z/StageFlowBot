@@ -32,7 +32,7 @@ from bot.file_manager import (
 )
 
 # --- service utils ---
-from service.logger import setup_logger
+from service.logger import setup_logging, get_logger
 
 # ============================================================
 # ⚙️ Конфигурация
@@ -52,15 +52,15 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 # 🪵 Логирование
 # ============================================================
-logger = setup_logger("stageflow.main")
-logger.info("🪵 Логирование инициализировано. Файл: /tmp/logs/stageflow.log")
+setup_logging()
+logger = get_logger("stageflow.main")
+logger.info("🪵 Логирование инициализировано (через service.logger)")
 
 # ============================================================
 # 🤖 Настройка бота
 # ============================================================
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-
 
 # ============================================================
 # 🧭 Команды
@@ -96,7 +96,7 @@ async def handle_docx(message: types.Message):
         saved_path = await save_uploaded_file(bot, document, user_dir)
         logger.info(f"📥 Получен файл: {saved_path}")
 
-        # === 2️⃣ Парсим документ ===
+        # === 2️⃣ Парсинг ===
         program = parse_docx(str(saved_path))
         parsed_json_path = user_dir / f"parsed_{time.strftime('%H%M%S')}.json"
 
@@ -123,7 +123,7 @@ async def handle_docx(message: types.Message):
             caption="🧾 Распарсенный JSON (исходная таблица).",
         )
 
-        # === 3️⃣ Генерация вариантов ===
+        # === 3️⃣ Генерация ===
         await message.answer(responses.OPTIMIZATION_STARTED)
         arrangements = await generate_arrangements(program.blocks)
         arrangements_json = user_dir / f"arrangements_{time.strftime('%H%M%S')}.json"
@@ -148,17 +148,17 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
         await message.answer_document(FSInputFile(zip_path), caption="📦 StageFlow — результаты работы")
-
         await message.answer(responses.DONE)
 
     except Exception as e:
-        logger.exception(f"Ошибка при обработке: {e}")
+        logger.exception(f"Ошибка при обработке файла: {e}")
         error_path = user_dir / f"error_{time.strftime('%H%M%S')}.json"
         await save_json({"error": str(e)}, error_path)
         await message.answer(responses.ERROR_MESSAGE.format(error=e))
         await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
+
     finally:
-        # === 6️⃣ Очистка (сохранить результаты) ===
+        # === 6️⃣ Очистка (с сохранением результатов) ===
         try:
             await cleanup_temp(user_dir, keep_results=True)
         except Exception as e:
