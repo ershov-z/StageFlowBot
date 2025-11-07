@@ -9,7 +9,7 @@ from loguru import logger
 from core.types import Actor, Block, Program
 
 # ============================================================
-# 🎭 Загрузка списка актёров (как в v2, но оставляем)
+# 🎭 Загрузка списка актёров
 # ============================================================
 
 def _load_actor_names() -> set[str]:
@@ -68,6 +68,10 @@ def _try_split_concatenated(token: str) -> List[str]:
         return [s.capitalize() for s in out]
     return [token]
 
+# ============================================================
+# 🎭 Парсинг актёров и тегов
+# ============================================================
+
 def _parse_actor_tokens(raw: str) -> List[Actor]:
     res: List[Actor] = []
     for tok in _split(raw):
@@ -75,14 +79,20 @@ def _parse_actor_tokens(raw: str) -> List[Actor]:
             continue
         tags = []
         name = tok
+
         if "%" in name:
             tags.append("later")
         if "!" in name:
             tags.append("early")
-        if re.search(r"\(?\bг\s*к\b\)?", name, flags=re.IGNORECASE):
-            tags.append("gk")
-        name = re.sub(r"\(?\bг\s*к\b\)?", "", name, flags=re.IGNORECASE)
+
+        # новый тег зк → vo
+        if re.search(r"\(?\bз\s*к\b\)?", name, flags=re.IGNORECASE):
+            tags.append("vo")
+
+        # очищаем имя от служебных пометок (гк и зк)
+        name = re.sub(r"\(?\b(з\s*к|г\s*к)\b\)?", "", name, flags=re.IGNORECASE)
         name = _clean_name(name)
+
         for nm in _try_split_concatenated(name):
             nm = " ".join(nm.split())
             if nm:
@@ -114,10 +124,6 @@ def _is_kv(cell_text: str) -> bool:
 # 🗂️ Определение схемы колонок
 # ============================================================
 
-# Поддерживаем две схемы:
-#  A) v2-старая: [0 №][1 Актёры][2 ПП][3 Найм][4 Ответств][5 Кв]        (6 колонок)
-#  B) новая v1-стиль: [0 №][1 Название][2 Актёры][3 ПП][4 Найм][5 Отв][6 Кв] (7 колонок)
-
 def _normalize_header(s: str) -> str:
     return (s or "").strip().lower()
 
@@ -131,7 +137,6 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
                 return idx[a]
         return None
 
-    # Пытаемся распознать «новую» схему (наличие колонки «название»)
     title_i = find("название", "номер", "назв", "title")
     actors_i = find("актеры", "актёры", "участники", "actors")
     pp_i     = find("пп", "pp")
@@ -140,10 +145,9 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
     kv_i     = find("кв", "kv")
     num_i    = find("№", "номер", "num", "#", "n")
 
-    # Полная новая схема
     if title_i is not None and actors_i is not None and pp_i is not None and kv_i is not None:
         if num_i is None:
-            num_i = 0  # чаще всего первая колонка
+            num_i = 0
         if hire_i is None:
             hire_i = 4 if len(h) > 4 else None
         if resp_i is None:
@@ -151,11 +155,8 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
         return {"num": num_i, "title": title_i, "actors": actors_i, "pp": pp_i,
                 "hire": hire_i, "resp": resp_i, "kv": kv_i}
 
-    # Старая v2-схема (без «Название»)
     if actors_i is not None and pp_i is not None and kv_i is not None and title_i is None:
         num_i = num_i if num_i is not None else 0
-        # Примем эвристику по позициям
-        # 0 №, 1 Актёры, 2 ПП, 3 Найм, 4 Ответственный, 5 Кв
         return {"num": num_i, "title": None, "actors": actors_i, "pp": pp_i,
                 "hire": 3 if len(h) > 3 else None,
                 "resp": 4 if len(h) > 4 else None,
@@ -165,9 +166,7 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
 
 def _fallback_mapping_by_count(n_cols: int) -> Dict[str, int | None]:
     if n_cols >= 7:
-        # Новая схема по умолчанию
         return {"num": 0, "title": 1, "actors": 2, "pp": 3, "hire": 4, "resp": 5, "kv": 6}
-    # Старая схема
     return {"num": 0, "title": None, "actors": 1, "pp": 2, "hire": 3 if n_cols > 3 else None,
             "resp": 4 if n_cols > 4 else None, "kv": 5 if n_cols > 5 else None}
 
@@ -188,12 +187,11 @@ def parse_docx(path: str) -> Program:
         logger.error("❌ Первая таблица пуста.")
         return Program(blocks=[])
 
-    # Определяем маппинг колонок
     header_cells = [c.text for c in rows[0].cells]
     mapping = _guess_mapping_by_header(header_cells)
     if mapping is None:
         mapping = _fallback_mapping_by_count(len(rows[0].cells))
-        logger.warning("⚠ Заголовки не распознаны однозначно — используем эвристику по позициям.")
+        logger.warning("⚠ Заголовки не распознаны — используем эвристику по позициям.")
 
     def get(cells: List[str], key: str) -> str:
         i = mapping.get(key)
@@ -215,10 +213,7 @@ def parse_docx(path: str) -> Program:
         resp       = get(cells, "resp")
         kv_raw     = get(cells, "kv")
 
-        # Если колонки "Название" нет (старая схема) — пытаемся вывести его из других ячеек.
-        # В v1 оно было отдельным, но если его нет — оставим пустым (экспортер потом заполнит).
         if not title:
-            # мягкая эвристика: если в actors_raw явно «[filler] …»/«Предкулисье»/«Спонсоры», используем это как title
             maybe_title = actors_raw.strip()
             lowered = maybe_title.lower()
             if any(x in lowered for x in ("[filler]", "тянуч", "предкулисье", "спонсор", "sponsor")):
@@ -238,7 +233,6 @@ def parse_docx(path: str) -> Program:
             actors=actors,
             kv=kv,
             fixed=(block_type in {"prelude", "sponsor"}),
-            # --- Новые поля «v1-стиля» (см. types.py) ---
             num=num_raw or "",
             actors_raw=actors_raw or "",
             pp_raw=pp_raw or "",
@@ -247,16 +241,29 @@ def parse_docx(path: str) -> Program:
         ))
         next_id += 1
 
-    # Фиксация первых двух и последних двух performance-блоков (как в требованиях)
+    # ============================================================
+    # 🔒 Фиксация блоков по обновлённым требованиям
+    # ============================================================
+
     perf_indices = [i for i, b in enumerate(blocks) if b.type == "performance"]
-    if len(perf_indices) >= 1:
-        blocks[perf_indices[0]].fixed = True
-    if len(perf_indices) >= 2:
-        blocks[perf_indices[1]].fixed = True
-    if len(perf_indices) >= 4:
-        blocks[perf_indices[-2]].fixed = True
-    if len(perf_indices) >= 3:
-        blocks[perf_indices[-1]].fixed = True
+
+    # фиксируем предкулисье и спонсоров
+    for b in blocks:
+        if b.type in {"prelude", "sponsor"}:
+            b.fixed = True
+
+    # фиксируем первые два и последние четыре номера
+    for i in range(len(blocks)):
+        if i in perf_indices[:2] or i in perf_indices[-4:]:
+            blocks[i].fixed = True
+
+    # фиксируем тянучки между фиксированными номерами
+    for i, b in enumerate(blocks):
+        if b.type == "filler":
+            prev_fixed = i > 0 and blocks[i - 1].fixed
+            next_fixed = i < len(blocks) - 1 and blocks[i + 1].fixed
+            if prev_fixed and next_fixed:
+                b.fixed = True
 
     logger.info(f"✅ Прочитано блоков: {len(blocks)} | performance={len(perf_indices)}")
     return Program(blocks=blocks)

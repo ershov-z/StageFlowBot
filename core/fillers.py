@@ -33,21 +33,17 @@ def _is_actor_allowed(prev: Block, next: Block, actor_name: str) -> bool:
     """
     Проверяет, можно ли использовать актёра в тянучке.
     Нельзя, если:
-    - актёр есть в следующем номере с тегом gk
-    - актёр есть в предыдущем номере с тегом gk
-    - актёр есть в следующем номере без тега later
+    - актёр есть в следующем номере и не имеет тегов later или vo.
     """
-    if _has_actor_with_tag(next, actor_name, "gk"):
-        log.debug(f"🚫 {actor_name}: gk в следующем блоке ({next.name})")
-        return False
-
-    if _has_actor_with_tag(prev, actor_name, "gk"):
-        log.debug(f"🚫 {actor_name}: gk в предыдущем блоке ({prev.name})")
-        return False
-
-    if _actor_in_block(next, actor_name) and not _has_actor_with_tag(next, actor_name, "later"):
-        log.debug(f"🚫 {actor_name}: в следующем блоке без 'later' ({next.name})")
-        return False
+    # Проверяем, если актёр есть в следующем блоке
+    if _actor_in_block(next, actor_name):
+        # Если у него нет тегов later и vo — запрещено
+        if not (
+            _has_actor_with_tag(next, actor_name, "later")
+            or _has_actor_with_tag(next, actor_name, "vo")
+        ):
+            log.debug(f"🚫 {actor_name}: в следующем блоке без 'later'/'vo' ({next.name})")
+            return False
 
     return True
 
@@ -83,7 +79,7 @@ if __name__ == "__main__":
         id=1,
         name="Номер 1",
         type="performance",
-        actors=[Actor("Пушкин"), Actor("Рожков", ["gk"])],
+        actors=[Actor("Пушкин"), Actor("Рожков", ["vo"])],
     )
     next = Block(
         id=2,

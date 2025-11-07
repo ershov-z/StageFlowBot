@@ -95,7 +95,37 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     rng = random.Random(seed)
     seen_hashes: set[str] = set()
 
-    # Рабочая копия блоков
+    # ------------------------------------------------------------------
+    # 🔒 ДОСБОРКА ПРАВИЛ ФИКСАЦИИ (v2.4):
+    # фиксируем: предкулисье; первые 2 номера + их тянучки;
+    # последние 4 номера + их тянучки; спонсоры.
+    # Делаем это ДО сборки списков fixed_positions / variable_pool,
+    # чтобы флаги fixed корректно попали в рабочую копию. :contentReference[oaicite:1]{index=1}
+    # ------------------------------------------------------------------
+    # 1) заранее фиксируем типовые блоки
+    for b in blocks:
+        if b.type in {"prelude", "sponsor"}:
+            b.fixed = True
+
+    # 2) найдём индексы всех performance
+    perf_indices = [i for i, b in enumerate(blocks) if b.type == "performance"]
+
+    # 3) фиксируем первые 2 и последние 4 performance (если они есть)
+    for i in perf_indices[:2]:
+        blocks[i].fixed = True
+    for i in perf_indices[-4:]:
+        blocks[i].fixed = True
+
+    # 4) фиксируем тянучки, которые находятся МЕЖДУ уже фиксированными блоками
+    for i, b in enumerate(blocks):
+        if b.type == "filler":
+            prev_fixed = (i > 0) and blocks[i - 1].fixed
+            next_fixed = (i < len(blocks) - 1) and blocks[i + 1].fixed
+            if prev_fixed and next_fixed:
+                b.fixed = True
+    # ------------------------------------------------------------------
+
+    # Рабочая копия блоков (filler не переставляем)
     base_seq: List[Block] = [_copy_block(b) for b in blocks if b.type != "filler"]
     fixed_positions = {i for i, b in enumerate(base_seq) if b.fixed}
     fixed_at_index = {i: base_seq[i] for i in fixed_positions}

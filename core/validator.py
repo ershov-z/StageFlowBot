@@ -60,7 +60,6 @@ def validate_arrangement(blocks: list[Block]) -> bool:
 if __name__ == "__main__":
     from core.types import Actor
 
-    # Пример тестовых блоков
     perf1 = Block(1, "Номер 1", "performance", [Actor("Пушкин")], kv=False, fixed=True)
     perf2 = Block(2, "Номер 2", "performance", [Actor("Исаев")], kv=False)
     filler = Block(3, "[filler] Пушкин", "filler", [Actor("Пушкин")])
@@ -68,5 +67,4 @@ if __name__ == "__main__":
     perf4 = Block(5, "Номер 4", "performance", [Actor("Пушкин")], kv=True)
 
     blocks = [perf1, filler, perf2, perf3, perf4]
-
     validate_arrangement(blocks)
