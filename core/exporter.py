@@ -21,12 +21,6 @@ def _normalize_header(s: str) -> str:
 
 
 def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]]:
-    """
-    Возвращает индексы колонок по заголовку.
-    Поддерживает:
-      - Новую (v1-style): [№, Название, Актёры, ПП, Найм, Ответственный, Кв]
-      - Старую (v2):     [№, Актёры, ПП, Найм, Ответственный, Кв]
-    """
     h = [_normalize_header(x) for x in header_cells]
     idx = {name: i for i, name in enumerate(h)}
 
@@ -44,17 +38,13 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
     rsp_i  = find("ответственный", "ответств", "responsible")
     kv_i   = find("кв", "kv")
 
-    # Полная новая схема
     if all(x is not None for x in (num_i, name_i, act_i, pp_i, hire_i, rsp_i, kv_i)):
         return {"num": num_i, "name": name_i, "actors": act_i, "pp": pp_i, "hire": hire_i, "resp": rsp_i, "kv": kv_i}
 
-    # Старая схема (без «Название»)
     if all(x is not None for x in (num_i, act_i, pp_i, kv_i)):
-        # По умолчанию: 0 №, 1 Актёры, 2 ПП, 3 Найм, 4 Ответственный, 5 Кв
-        # Но если в заголовке иначе — используем найденные индексы.
         return {
             "num": num_i,
-            "name": None,          # нет колонки «Название»
+            "name": None,
             "actors": act_i,
             "pp": pp_i,
             "hire": hire_i if hire_i is not None else (3 if len(h) > 3 else None),
@@ -66,53 +56,19 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
 
 
 def _fallback_mapping_by_count(n_cols: int) -> Dict[str, Optional[int]]:
-    """Эвристика по количеству колонок, если заголовок странный или пустой."""
     if n_cols >= 7:
         return {"num": 0, "name": 1, "actors": 2, "pp": 3, "hire": 4, "resp": 5, "kv": 6}
-    # старая 6-колоночная сетка
     return {"num": 0, "name": None, "actors": 1, "pp": 2, "hire": 3 if n_cols > 3 else None,
             "resp": 4 if n_cols > 4 else None, "kv": 5 if n_cols > 5 else None}
 
 
 # ============================================================
-# 🎨 Оформление строк (не меняем шаблон, только подсветка)
+# 🎨 Оформление строк
 # ============================================================
 
-def _apply_block_style(row, block: Block):
-    """
-    Минимальное оформление для типов блоков.
-    Не трогает ширины, шрифты и стили — полностью сохраняет шаблон.
-    """
-    if block.type == "filler":
-        _set_row_shading(row, "FFF2CC")
-        _prefix_label(row, block, "[filler]")
-    elif block.type == "prelude":
-        _set_row_shading(row, "D9E1F2")
-        _prefix_label(row, block, "[prelude]")
-    elif block.type == "sponsor":
-        _set_row_shading(row, "E2EFDA")
-        _prefix_label(row, block, "[sponsor]")
-
-
-def _prefix_label(row, block: Block, label: str):
-    """
-    Добавляет текстовую метку в начало колонки «Название» (если есть),
-    иначе — в колонку «Актёры».
-    """
-    cells = row.cells
-    # Предпочтительно — ячейка «Название» (index=1 в новой схеме),
-    # но позицию мы заранее не знаем. Возьмём вторую ячейку, это «Название» в новой схеме.
-    target_idx = 1 if len(cells) >= 7 else 1  # во «второй» колонке метка выглядит уместнее
-    cell = cells[target_idx]
-    current = (cell.text or "").strip()
-    cell.text = f"{label} {current}" if current else label
-
-
 def _set_row_shading(row, color_hex: str):
-    """Устанавливает цвет фона для всей строки без изменения структуры."""
     from docx.oxml import parse_xml
     from docx.oxml.ns import nsdecls
-
     for cell in row.cells:
         cell._element.get_or_add_tcPr().append(
             parse_xml(rf'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
@@ -124,12 +80,6 @@ def _set_row_shading(row, color_hex: str):
 # ============================================================
 
 def export_arrangement(arrangement: Arrangement, template_path: Path, output_path: Path) -> Path:
-    """
-    Преобразует Arrangement (список блоков) в .docx таблицу на основе шаблона.
-    Сохраняет формат оригинала, добавляя:
-      • сквозную нумерацию только для type == "performance";
-      • значения «Актёры» = actors_raw, «ПП» = pp_raw (без повторного парсинга).
-    """
     logger.info(f"[EXPORT] Начат экспорт seed={arrangement.seed}")
 
     doc = Document(template_path)
@@ -138,13 +88,11 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
 
     table = doc.tables[0]
 
-    # --- Определяем маппинг колонок ---
     header_cells = [c.text for c in table.rows[0].cells] if table.rows else []
     mapping = _guess_mapping_by_header(header_cells)
     if mapping is None:
         mapping = _fallback_mapping_by_count(len(table.rows[0].cells))
 
-    # --- Очищаем все строки кроме заголовка ---
     while len(table.rows) > 1:
         table._element.remove(table.rows[1]._element)
 
@@ -158,7 +106,7 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
             if idx is not None and idx < len(cells):
                 cells[idx].text = text
 
-        # № — только для выступлений
+        # Нумерация только для выступлений
         if block.type == "performance":
             seq += 1
             set_cell("num", str(seq))
@@ -166,14 +114,36 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
             set_cell("num", "")
 
         # Название
+        display_name = block.name or ""
+        if block.type == "prelude":
+            display_name = "Предкулисье"
+        elif block.type == "filler":
+            display_name = "Тянучка"
+        elif block.type == "sponsor":
+            display_name = "Спонсоры"
         if mapping.get("name") is not None:
-            set_cell("name", block.name or "")
+            set_cell("name", display_name)
 
-        # Актёры (сырой текст из исходной таблицы)
-        set_cell("actors", getattr(block, "actors_raw", "") or "")
+        # Оформление цветов
+        if block.type == "filler":
+            _set_row_shading(row, "FFF2CC")
+        elif block.type == "prelude":
+            _set_row_shading(row, "D9E1F2")
+        elif block.type == "sponsor":
+            _set_row_shading(row, "E2EFDA")
 
-        # ПП (сырой текст из исходной таблицы)
-        set_cell("pp", getattr(block, "pp_raw", "") or "")
+        # Колонки "Актёры" и "ПП"
+        if block.type == "filler":
+            actor_name = (block.actors[0].name if block.actors else "").strip()
+            if actor_name.lower() == "пушкин":
+                set_cell("pp", "Пушкин")
+                set_cell("actors", "")
+            else:
+                set_cell("actors", actor_name)
+                set_cell("pp", "")
+        else:
+            set_cell("actors", getattr(block, "actors_raw", "") or "")
+            set_cell("pp", getattr(block, "pp_raw", "") or "")
 
         # Найм / Ответственный
         set_cell("hire", getattr(block, "hire", "") or "")
@@ -181,8 +151,6 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
 
         # kv — метка
         set_cell("kv", "кв" if getattr(block, "kv", False) else "")
-
-        _apply_block_style(row, block)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
@@ -195,10 +163,6 @@ def export_arrangement(arrangement: Arrangement, template_path: Path, output_pat
 # ============================================================
 
 def export_all(arrangements: list[Arrangement], template_path: Path, export_dir: Path) -> Path:
-    """
-    Экспортирует все варианты программы (DOCX + JSON) и упаковывает их в ZIP.
-    JSON содержит все поля, по которым можно воспроизвести DOCX.
-    """
     logger.info("[EXPORT_ALL] Начинается пакетный экспорт всех вариантов")
 
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -208,10 +172,8 @@ def export_all(arrangements: list[Arrangement], template_path: Path, export_dir:
         output_docx = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.docx"
         output_json = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.json"
 
-        # DOCX
         export_arrangement(arrangement, template_path, output_docx)
 
-        # JSON (полный)
         json_data = [
             {
                 "id": b.id,
@@ -231,10 +193,8 @@ def export_all(arrangements: list[Arrangement], template_path: Path, export_dir:
         with open(output_json, "w", encoding="utf-8") as f:
             json.dump(json_data, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"[EXPORT_ALL] Сохранён JSON: {output_json}")
         exported_files.extend([output_docx, output_json])
 
-    # ZIP
     zip_path = export_dir / "StageFlow_Results.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for path in exported_files:
