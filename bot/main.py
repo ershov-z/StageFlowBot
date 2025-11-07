@@ -28,7 +28,6 @@ from bot.file_manager import (
     get_user_dir,
     get_results_dir,
     save_json,
-    export_variants,
 )
 
 # --- service utils ---
@@ -148,11 +147,15 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.EXPORT_STARTED)
         template_path = saved_path
 
-        zip_path = export_variants(valid_arrangements, export_all, template_path, results_dir)
+        # ✅ Исправлено: используем напрямую export_all без двойного архивирования
+        zip_path = export_all(valid_arrangements, template_path, results_dir)
 
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
-        await message.answer_document(FSInputFile(zip_path), caption="📦 StageFlow — результаты работы")
+        await message.answer_document(
+            FSInputFile(zip_path),
+            caption="📦 StageFlow — результаты работы"
+        )
         await message.answer(responses.DONE)
 
     except Exception as e:
@@ -213,11 +216,9 @@ async def on_startup(app):
     except Exception as e:
         logger.error(f"❌ Ошибка при установке webhook: {e}")
 
-    # ✅ заменено: app.loop.create_task(...) → asyncio.create_task(...)
     asyncio.create_task(keep_alive())
 
 async def on_shutdown(app):
-    # ❗ Не удаляем вебхук на проде, чтобы бот продолжал принимать обновления
     try:
         await bot.session.close()
     finally:
