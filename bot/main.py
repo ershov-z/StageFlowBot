@@ -143,7 +143,11 @@ async def handle_docx(message: types.Message):
         # === 5️⃣ Экспорт и упаковка ===
         await message.answer(responses.EXPORT_STARTED)
         template_path = saved_path
+
+        # FIX: export_variants теперь возвращает путь к ГОТОВОМУ ZIP (из export_all)
+        # и НЕ создаёт вложенный архив сам в себя. Совместимо с текущим file_manager.
         zip_path = export_variants(valid_arrangements, export_all, template_path, results_dir)
+
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
         await message.answer_document(FSInputFile(zip_path), caption="📦 StageFlow — результаты работы")
