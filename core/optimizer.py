@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 from copy import deepcopy
 import gc
 from math import inf
+from itertools import permutations
 
 from core.types import Block, Arrangement, Actor
 from core.conflicts import strong_conflict, weak_conflict, kv_conflict
@@ -102,7 +103,7 @@ def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Bl
 
 
 # ============================================================
-# Теоретическая проверка (DP)
+# Теоретическая проверка (точно для маленьких сегментов, DP — иначе)
 # ============================================================
 
 def _edge_cost(a: Block, b: Block) -> int:
@@ -113,15 +114,50 @@ def _edge_cost(a: Block, b: Block) -> int:
     return 0
 
 
+def _segment_cost_with_bounds(order: List[Block], L: Block, R: Block) -> int:
+    """Стоимость пути L -> order[0] -> ... -> order[-1] -> R (кол-во слабых)."""
+    if not order:
+        return _edge_cost(L, R)
+    total = _edge_cost(L, order[0])
+    for i in range(len(order) - 1):
+        c = _edge_cost(order[i], order[i + 1])
+        if c == inf:
+            return inf
+        total += c
+    c_end = _edge_cost(order[-1], R)
+    if c_end == inf:
+        return inf
+    return total
+
+
 def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, int, List[Block]]:
+    """
+    Возвращает (feasible, min_cost, ordered_blocks).
+    Точно считает перебором для n ≤ 8, иначе — DP.
+    """
     n = len(movable)
     if n == 0:
         return True, 0, []
 
+    # Быстрая необходимая проверка по kv
     kv_cnt = sum(1 for b in movable if b.kv)
     if kv_cnt > n - kv_cnt + 1:
         return False, 999, []
 
+    # --- Точный перебор для малых сегментов ---
+    if n <= 8:
+        best_cost, best_order = inf, None
+        for perm in permutations(movable, n):
+            cost = _segment_cost_with_bounds(list(perm), L, R)
+            if cost < best_cost:
+                best_cost, best_order = cost, list(perm)
+                if best_cost == 0:
+                    break
+        if best_cost == inf:
+            return False, 999, []
+        return True, int(best_cost), best_order
+
+    # --- DP для больших сегментов ---
     w = [[inf] * n for _ in range(n)]
     cost_L = [inf] * n
     cost_R = [inf] * n
@@ -170,7 +206,7 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
     if best_cost == inf:
         return False, 999, []
 
-    # восстановление
+    # восстановление пути
     order_idx: List[int] = []
     mask, j = full, best_end
     while j not in (-1, -2):
@@ -190,9 +226,15 @@ def _build_ideal_order(blocks: List[Block]) -> Tuple[bool, int, List[Block]]:
     for b in base:
         if b.type in {"prelude", "sponsor"} or b.type == "filler":
             b.fixed = True
+
+    # аккуратно фиксируем первые 2 и последние 4 performance — без перекрытия на коротких программах
     perf_idx = [i for i, b in enumerate(base) if b.type == "performance"]
-    for i in perf_idx[:2] + perf_idx[-4:]:
-        base[i].fixed = True
+    if len(perf_idx) >= 6:
+        for i in perf_idx[:2] + perf_idx[-4:]:
+            base[i].fixed = True
+    elif len(perf_idx) >= 2:
+        for i in perf_idx[:2]:
+            base[i].fixed = True
 
     anchors = [i for i, b in enumerate(base) if b.fixed]
     anchors = sorted(set(anchors + [0, len(base) - 1]))
@@ -219,21 +261,18 @@ def _build_ideal_order(blocks: List[Block]) -> Tuple[bool, int, List[Block]]:
 
 def theoretical_feasibility_exact(blocks: List[Block], max_fillers_total: int) -> dict:
     """
-    ВАЖНОЕ ИЗМЕНЕНИЕ:
-    Сравниваем общее минимально нужное число тянучек с ОБЩИМ лимитом (max_fillers_total),
-    а не с остатком. Иначе случаи "впритык" ошибочно считались неразрешимыми.
+    Сравниваем общее минимально нужное число тянучек с ОБЩИМ лимитом.
     """
     existing = sum(1 for b in blocks if b.type == "filler")
-    available_rest = max(0, max_fillers_total - existing)  # оставшиеся, для сообщений
+    available_rest = max(0, max_fillers_total - existing)  # для сообщения пользователю
     feasible, min_weak, ideal_order = _build_ideal_order(blocks)
 
-    # ✔ ключевая правка — проверяем против общего лимита
     can_fit = feasible and (min_weak <= max_fillers_total)
 
     return {
         "feasible": can_fit,
         "min_weak_needed": int(min_weak if feasible else 999),
-        "available_fillers": int(available_rest),   # оставляем для UX-сообщения
+        "available_fillers": int(available_rest),
         "strong_possible": feasible,
         "order": ideal_order if feasible else blocks,
     }
@@ -312,8 +351,12 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         if b.type in {"prelude", "sponsor"} or b.type == "filler":
             b.fixed = True
     perf_idx = [i for i, b in enumerate(base) if b.type == "performance"]
-    for i in perf_idx[:2] + perf_idx[-4:]:
-        base[i].fixed = True
+    if len(perf_idx) >= 6:
+        for i in perf_idx[:2] + perf_idx[-4:]:
+            base[i].fixed = True
+    elif len(perf_idx) >= 2:
+        for i in perf_idx[:2]:
+            base[i].fixed = True
 
     movable = [b for b in base if b.type == "performance" and not b.fixed]
     if not movable:
