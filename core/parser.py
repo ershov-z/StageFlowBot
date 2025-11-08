@@ -45,15 +45,27 @@ def _split(blob: str) -> List[str]:
         return []
     return [t.strip() for t in _SPLIT_RE.split(blob) if t.strip()]
 
+
 def _clean_name(token: str) -> str:
-    return re.sub(r"[%!\d.,]+", "", token).strip()
+    """Удаляет знаки %, !, цифры, невидимые символы и обрезает пробелы."""
+    token = re.sub(r"[%!\d.,]+", "", token)
+    token = token.replace("\u200b", "").replace("\xa0", " ")
+    return token.strip()
+
 
 def _try_split_concatenated(token: str) -> List[str]:
+    """
+    Пытается разбить слепленные имена на основе actors_list.json.
+    Пример: 'ПушкинИсаев' → ['Пушкин', 'Исаев']
+    """
     if not ACTOR_NAMES:
-        return [token]
-    low = token.lower()
+        return [token.strip()]
+
+    clean = token.strip().replace("\u200b", "").replace("\xa0", " ")
+    low = clean.lower()
     out, i = [], 0
     names_sorted = sorted(ACTOR_NAMES, key=len, reverse=True)
+
     while i < len(low):
         matched = False
         for name in names_sorted:
@@ -64,9 +76,11 @@ def _try_split_concatenated(token: str) -> List[str]:
                 break
         if not matched:
             i += 1
+
     if len(out) > 1:
         return [s.capitalize() for s in out]
-    return [token]
+    return [clean.capitalize()]
+
 
 # ============================================================
 # 🎭 Парсинг актёров и тегов
@@ -77,6 +91,7 @@ def _parse_actor_tokens(raw: str) -> List[Actor]:
     for tok in _split(raw):
         if not tok:
             continue
+
         tags = []
         name = tok
 
@@ -99,6 +114,7 @@ def _parse_actor_tokens(raw: str) -> List[Actor]:
                 res.append(Actor(name=nm, tags=sorted(set(tags))))
     return res
 
+
 def _merge_actors(main_list: List[Actor], pp_list: List[Actor]) -> List[Actor]:
     merged = {}
     for a in main_list:
@@ -106,6 +122,7 @@ def _merge_actors(main_list: List[Actor], pp_list: List[Actor]) -> List[Actor]:
     for a in pp_list:
         merged.setdefault(a.name, set()).update(a.tags)
     return [Actor(name=k, tags=sorted(v)) for k, v in merged.items()]
+
 
 def _detect_type(title: str) -> str:
     t = (title or "").lower()
@@ -117,8 +134,10 @@ def _detect_type(title: str) -> str:
         return "sponsor"
     return "performance"
 
+
 def _is_kv(cell_text: str) -> bool:
     return bool(re.search(r"\bкв\b", cell_text or "", flags=re.IGNORECASE))
+
 
 # ============================================================
 # 🗂️ Определение схемы колонок
@@ -126,6 +145,7 @@ def _is_kv(cell_text: str) -> bool:
 
 def _normalize_header(s: str) -> str:
     return (s or "").strip().lower()
+
 
 def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]]:
     h = [_normalize_header(x) for x in header_cells]
@@ -164,11 +184,14 @@ def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]
 
     return None
 
+
 def _fallback_mapping_by_count(n_cols: int) -> Dict[str, int | None]:
     if n_cols >= 7:
         return {"num": 0, "title": 1, "actors": 2, "pp": 3, "hire": 4, "resp": 5, "kv": 6}
-    return {"num": 0, "title": None, "actors": 1, "pp": 2, "hire": 3 if n_cols > 3 else None,
+    return {"num": 0, "title": None, "actors": 1, "pp": 2,
+            "hire": 3 if n_cols > 3 else None,
             "resp": 4 if n_cols > 4 else None, "kv": 5 if n_cols > 5 else None}
+
 
 # ============================================================
 # 📘 Основной парсер
