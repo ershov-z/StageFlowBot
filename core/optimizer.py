@@ -218,16 +218,22 @@ def _build_ideal_order(blocks: List[Block]) -> Tuple[bool, int, List[Block]]:
 
 
 def theoretical_feasibility_exact(blocks: List[Block], max_fillers_total: int) -> dict:
+    """
+    ВАЖНОЕ ИЗМЕНЕНИЕ:
+    Сравниваем общее минимально нужное число тянучек с ОБЩИМ лимитом (max_fillers_total),
+    а не с остатком. Иначе случаи "впритык" ошибочно считались неразрешимыми.
+    """
     existing = sum(1 for b in blocks if b.type == "filler")
-    available = max(0, max_fillers_total - existing)
+    available_rest = max(0, max_fillers_total - existing)  # оставшиеся, для сообщений
     feasible, min_weak, ideal_order = _build_ideal_order(blocks)
 
-    # ✅ главное изменение — разрешаем равенство
-    can_fit = feasible and min_weak <= available
+    # ✔ ключевая правка — проверяем против общего лимита
+    can_fit = feasible and (min_weak <= max_fillers_total)
+
     return {
         "feasible": can_fit,
         "min_weak_needed": int(min_weak if feasible else 999),
-        "available_fillers": int(available),
+        "available_fillers": int(available_rest),   # оставляем для UX-сообщения
         "strong_possible": feasible,
         "order": ideal_order if feasible else blocks,
     }
@@ -239,7 +245,10 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
     feas = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
 
     if not feas["feasible"]:
-        log.error(f"❌ Теоретически неразрешимо: нужно {feas['min_weak_needed']} тянучек, а доступно {feas['available_fillers']}.")
+        log.error(
+            f"❌ Теоретически неразрешимо: нужно {feas['min_weak_needed']} тянучек, "
+            f"а доступно {feas['available_fillers']}."
+        )
         return Arrangement(
             seed=0,
             blocks=blocks,
@@ -259,8 +268,8 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
         )
 
     base_order = feas["order"]
-    allowed = max(0, MAX_FILLERS_TOTAL - existing)
-    with_fillers = _insert_fillers(base_order, allowed, seed=0)
+    allowed_new = max(0, MAX_FILLERS_TOTAL - existing)
+    with_fillers = _insert_fillers(base_order, allowed_new, seed=0)
 
     strong_cnt = sum(
         (strong_conflict(with_fillers[i], with_fillers[i + 1]) or kv_conflict(with_fillers[i], with_fillers[i + 1]))
@@ -273,7 +282,10 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
         if with_fillers[i].type == with_fillers[i + 1].type == "performance"
     )
 
-    log.info(f"🌟 Идеальный вариант построен: тянучек={len(with_fillers) - len(base_order)} | сильных={strong_cnt} | слабых={weak_cnt}")
+    log.info(
+        f"🌟 Идеальный вариант построен: тянучек={len(with_fillers) - len(base_order)} | "
+        f"сильных={strong_cnt} | слабых={weak_cnt}"
+    )
     return Arrangement(
         seed=0,
         blocks=with_fillers,
