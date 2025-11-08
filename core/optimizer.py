@@ -1,10 +1,10 @@
-# core/optimizer.py
 from __future__ import annotations
 import asyncio
 import random
 from typing import List, Optional
 from copy import deepcopy
 import gc
+from collections import defaultdict
 
 from core.types import Block, Arrangement, Actor
 from core.conflicts import strong_conflict, weak_conflict, kv_conflict
@@ -17,15 +17,54 @@ log = get_logger("stageflow.optimizer")
 
 MAX_FILLERS_TOTAL = 3
 MAX_VARIANTS = 5
-MAX_TRIES = 1000
+MAX_TRIES = 10000  # увеличено согласно новым требованиям
 
+# ============================================================
+# Теоретическая проверка разрешимости программы
+# ============================================================
+def theoretical_feasibility(blocks: List[Block], existing_fillers: int, max_fillers: int) -> dict:
+    """Проверяет теоретическую возможность разрешения программы."""
+    graph = defaultdict(set)
+
+    # Собираем граф слабых конфликтов
+    for i, a in enumerate(blocks):
+        for j, b in enumerate(blocks):
+            if i < j and weak_conflict(a, b):
+                graph[i].add(j)
+                graph[j].add(i)
+
+    # Находим связные компоненты
+    visited = set()
+    components = []
+    for i in range(len(blocks)):
+        if i not in visited and i in graph:
+            stack = [i]
+            comp = set()
+            while stack:
+                n = stack.pop()
+                if n not in visited:
+                    visited.add(n)
+                    comp.add(n)
+                    stack.extend(graph[n])
+            components.append(comp)
+
+    # Подсчёт необходимых тянучек
+    needed_fillers = sum(len(c) - 1 for c in components if len(c) > 1)
+    available_fillers = max_fillers - existing_fillers
+    feasible = needed_fillers <= available_fillers
+
+    return {
+        "feasible": feasible,
+        "needed_fillers": needed_fillers,
+        "available_fillers": available_fillers,
+        "components": len(components)
+    }
 
 # ============================================================
 # Helpers
 # ============================================================
 
 def _copy_block(block: Block) -> Block:
-    """Глубокая копия блока (включая raw-поля)."""
     return Block(
         id=block.id,
         name=block.name,
@@ -41,9 +80,7 @@ def _copy_block(block: Block) -> Block:
         responsible=block.responsible,
     )
 
-
 def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
-    """Создаёт filler между двумя номерами."""
     actor = Actor(actor_name)
     return Block(
         id=next_id,
@@ -60,9 +97,7 @@ def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Bloc
         meta={"auto": True, "between": (prev.name, nxt.name)},
     )
 
-
 def _count_weak_conflicts(blocks: List[Block]) -> int:
-    """Подсчёт слабых конфликтов между соседними номерами."""
     count = 0
     for i in range(len(blocks) - 1):
         a, b = blocks[i], blocks[i + 1]
@@ -71,9 +106,7 @@ def _count_weak_conflicts(blocks: List[Block]) -> int:
                 count += 1
     return count
 
-
 def _has_strong_conflicts(blocks: List[Block]) -> bool:
-    """Проверяет наличие сильных конфликтов между соседями."""
     for i in range(len(blocks) - 1):
         a, b = blocks[i], blocks[i + 1]
         if a.type == "performance" and b.type == "performance":
@@ -81,9 +114,7 @@ def _has_strong_conflicts(blocks: List[Block]) -> bool:
                 return True
     return False
 
-
 def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Block]:
-    """Вставляет тянучки на местах слабых конфликтов."""
     rng = random.Random(seed)
     result: List[Block] = []
     next_id = max((b.id for b in blocks), default=0) + 1
@@ -108,25 +139,37 @@ def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Bl
         result.append(b)
     return result
 
-
 # ============================================================
-# Core logic — Two-phase optimizer
+# Core logic
 # ============================================================
 
 @measure_time("optimizer.stochastic_branch_and_bound")
 async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
-    """
-    Формирует вариант программы по двухфазной логике:
-    1️⃣ Перестановка без сильных конфликтов и с ≤ (3 - existing_fillers) слабых.
-    2️⃣ Вставка тянучек между оставшимися конфликтами.
-    """
     rng = random.Random(seed)
     log.info("🧮 Оптимайзер запущен (seed=%s)", seed)
 
-    # === Учитываем уже существующие тянучки ===
     existing_fillers = sum(1 for b in blocks if b.type == "filler")
     max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing_fillers)
     log.info(f"[SEED={seed}] исходных тянучек={existing_fillers}, допустимо слабых конфликтов={max_weak_allowed}")
+
+    # 🔹 Проверяем теоретическую возможность
+    feasibility = theoretical_feasibility(blocks, existing_fillers, MAX_FILLERS_TOTAL)
+    if not feasibility["feasible"]:
+        log.error(
+            f"❌ Программа неразрешима теоретически: требуется минимум {feasibility['needed_fillers']} тянучек, "
+            f"доступно {feasibility['available_fillers']}."
+        )
+        return Arrangement(
+            seed=seed,
+            blocks=blocks,
+            fillers_used=existing_fillers,
+            strong_conflicts=0,
+            weak_conflicts=0,
+            meta={"status": "infeasible", "message": (
+                f"Эту программу разрешить невозможно: требуется минимум {feasibility['needed_fillers']} тянучек, "
+                f"а доступно только {feasibility['available_fillers']}. Загрузите другой файл."
+            )}
+        )
 
     # === Фиксированные блоки ===
     base_seq: List[Block] = [_copy_block(b) for b in blocks]
@@ -146,7 +189,6 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         log.warning(f"⚠️ Все блоки фиксированы (seed={seed}), перестановка невозможна.")
         return Arrangement(seed=seed, blocks=blocks, fillers_used=existing_fillers)
 
-    # === Фаза 1: поиск перестановок ===
     best_variant: Optional[List[Block]] = None
     best_weak = 999
     tries = 0
@@ -156,7 +198,6 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         shuffled = movable_blocks[:]
         rng.shuffle(shuffled)
 
-        # Собираем полную последовательность с фиксами
         new_order: List[Block] = []
         m_idx = 0
         for b in base_seq:
@@ -166,12 +207,10 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                 new_order.append(shuffled[m_idx])
                 m_idx += 1
 
-        # Проверяем конфликты
         if _has_strong_conflicts(new_order):
             continue
         weak_cnt = _count_weak_conflicts(new_order)
         if weak_cnt <= max_weak_allowed:
-            # если идеально (0 weak), сразу берём
             if weak_cnt == 0:
                 best_variant = new_order
                 best_weak = 0
@@ -181,30 +220,19 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                 best_variant = new_order
                 best_weak = weak_cnt
 
-    # === Проверка результата ===
     if not best_variant:
         log.error(f"❌ Оптимайзер не смог найти допустимую перестановку (seed={seed}) после {MAX_TRIES} попыток.")
         return Arrangement(seed=seed, blocks=blocks, fillers_used=existing_fillers)
 
     log.info(f"✅ Найден вариант после {tries} попыток (weak={best_weak}, seed={seed})")
 
-    # === Фаза 2: вставка тянучек ===
     allowed_fillers = max(0, MAX_FILLERS_TOTAL - existing_fillers)
     with_fillers = _insert_fillers(best_variant, allowed_fillers, seed)
 
-    strong_cnt = sum(
-        strong_conflict(with_fillers[i], with_fillers[i + 1])
-        for i in range(len(with_fillers) - 1)
-    )
-    weak_cnt_final = sum(
-        weak_conflict(with_fillers[i], with_fillers[i + 1])
-        for i in range(len(with_fillers) - 1)
-    )
+    strong_cnt = sum(strong_conflict(with_fillers[i], with_fillers[i + 1]) for i in range(len(with_fillers) - 1))
+    weak_cnt_final = sum(weak_conflict(with_fillers[i], with_fillers[i + 1]) for i in range(len(with_fillers) - 1))
 
-    log.info(
-        f"🎬 Итог: вставлено тянучек={len(with_fillers) - len(best_variant)} | "
-        f"сильных={strong_cnt} | слабых={weak_cnt_final}"
-    )
+    log.info(f"🎬 Итог: вставлено тянучек={len(with_fillers) - len(best_variant)} | сильных={strong_cnt} | слабых={weak_cnt_final}")
 
     return Arrangement(
         seed=seed,
@@ -214,15 +242,12 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         weak_conflicts=weak_cnt_final,
     )
 
-
 # ============================================================
 # Multiple variants
 # ============================================================
 
 @measure_time("optimizer.generate_arrangements")
-async def generate_arrangements(blocks: List[Block],
-                                n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
-    """Создаёт до 5 уникальных вариантов программы."""
+async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
     seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
     log.info(f"🧬 Seeds: {seeds}")
 

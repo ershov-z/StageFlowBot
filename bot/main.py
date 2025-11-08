@@ -1,4 +1,3 @@
-# bot/main.py
 from __future__ import annotations
 
 import os
@@ -44,8 +43,7 @@ if not BOT_TOKEN:
 PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
 
-# Поддержка Render и Koyeb (универсально)
-APP_URL = os.getenv("APP_URL")  # например: mybot.koyeb.app
+APP_URL = os.getenv("APP_URL")
 RENDER_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", APP_URL or "localhost")
 
 WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/stageflow"))
@@ -128,6 +126,16 @@ async def handle_docx(message: types.Message):
         # === 3️⃣ Генерация ===
         await message.answer(responses.OPTIMIZATION_STARTED)
         arrangements = await generate_arrangements(program.blocks)
+
+        # Проверяем: если программа неразрешима (infeasible)
+        if arrangements and hasattr(arrangements[0], "meta") and arrangements[0].meta and arrangements[0].meta.get("status") == "infeasible":
+            msg = arrangements[0].meta.get("message") or "Эту программу разрешить невозможно. Загрузите другой файл."
+            needed = arrangements[0].meta.get("needed_fillers", "?")
+            available = arrangements[0].meta.get("available_fillers", "?")
+            await message.answer(responses.OPTIMIZATION_INFEASIBLE.format(needed=needed, available=available))
+            logger.warning(f"🚫 Программа неразрешима для пользователя {user_id}: {msg}")
+            return
+
         arrangements_json = user_dir / f"arrangements_{time.strftime('%H%M%S')}.json"
         await save_json([a.seed for a in arrangements], arrangements_json)
 
@@ -135,6 +143,7 @@ async def handle_docx(message: types.Message):
         if not arrangements:
             logger.error("❌ Оптимизация не удалась — допустимых перестановок нет.")
             await message.answer(responses.OPTIMIZATION_FAILED)
+            return
         elif all(a.weak_conflicts > 0 for a in arrangements):
             logger.warning("⚠️ Оптимизация завершена частично — слабые конфликты остались.")
             await message.answer(responses.OPTIMIZATION_PARTIAL)
@@ -196,7 +205,6 @@ async def index(request):
 # ♻️ Автопинг (анти-сон)
 # ============================================================
 async def keep_alive():
-    """Пингует /health каждые 4 минуты, чтобы Koyeb/Render не засыпал."""
     base_url = (APP_URL or RENDER_HOSTNAME).replace("https://", "").strip().rstrip("/")
     url = f"https://{base_url}/health"
     while True:
@@ -209,7 +217,7 @@ async def keep_alive():
             logger.warning(f"Auto-ping failed: {e}")
 
 # ============================================================
-# 🔧 Исправленный on_startup с очисткой URL
+# 🔧 on_startup / on_shutdown
 # ============================================================
 async def on_startup(app):
     await asyncio.sleep(10)
