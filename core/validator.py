@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 from core.types import Block
-from core.conflicts import strong_conflict, kv_conflict
+from core.conflicts import strong_conflict, weak_conflict, kv_conflict
 
 log = logging.getLogger("stageflow.validator")
 
@@ -14,30 +14,51 @@ def validate_arrangement(blocks: list[Block]) -> bool:
     """
     Проверяет готовую программу на корректность.
     Возвращает True, если ошибок нет, иначе False.
-    """
 
+    Требования:
+    - не более 3 тянучек;
+    - отсутствие сильных конфликтов и kv:true подряд;
+    - отсутствие слабых конфликтов без тянучки между номерами.
+    """
     ok = True
     total_fillers = sum(1 for b in blocks if b.type == "filler")
 
-    # ------------------ 1. Проверка тянучек ------------------
+    # ------------------ 1. Проверка количества тянучек ------------------
     if total_fillers > 3:
         log.error(f"❌ Нарушение: слишком много тянучек ({total_fillers} > 3)")
         ok = False
 
-    # ------------------ 2. Сильные и kv-конфликты ------------
+    # ------------------ 2. Проверка конфликтов ------------------
     for i in range(len(blocks) - 1):
         a, b = blocks[i], blocks[i + 1]
 
+        # Пропускаем любые проверки между filler-блоками
+        if a.type == "filler" or b.type == "filler":
+            continue
+
+        # === Сильные конфликты ===
         if a.type == "performance" and b.type == "performance":
             if strong_conflict(a, b):
                 log.error(f"❌ Сильный конфликт между '{a.name}' и '{b.name}'")
                 ok = False
-
             if kv_conflict(a, b):
-                log.error(f"❌ kv:true рядом ('{a.name}' и '{b.name}')")
+                log.error(f"❌ kv:true подряд ('{a.name}' и '{b.name}')")
                 ok = False
 
-    # ------------------ 3. Порядок фиксированных -------------
+        # === Слабые конфликты без тянучки ===
+        # Если между performance-блоками НЕТ filler'а, проверяем weak_conflict
+        if a.type == "performance":
+            # Ищем ближайший следующий performance
+            j = i + 1
+            while j < len(blocks) and blocks[j].type == "filler":
+                j += 1
+            if j < len(blocks):
+                next_perf = blocks[j]
+                if next_perf.type == "performance" and weak_conflict(a, next_perf):
+                    log.error(f"❌ Слабый конфликт без тянучки: '{a.name}' → '{next_perf.name}'")
+                    ok = False
+
+    # ------------------ 3. Проверка порядка фиксированных ------------------
     fixed_blocks = [(i, b) for i, b in enumerate(blocks) if b.fixed]
     if fixed_blocks:
         ids_in_arrangement = [b.id for _, b in fixed_blocks]
@@ -47,6 +68,7 @@ def validate_arrangement(blocks: list[Block]) -> bool:
                 log.error(f"   - {idx}: {b.name} (id={b.id})")
             ok = False
 
+    # ------------------ Итог ------------------
     if ok:
         log.info(f"✅ Вариант корректен: {len(blocks)} блоков, {total_fillers} тянучек")
     else:

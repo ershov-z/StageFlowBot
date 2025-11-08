@@ -2,8 +2,7 @@
 from __future__ import annotations
 import asyncio
 import random
-import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from copy import deepcopy
 import gc
 
@@ -12,11 +11,13 @@ from core.conflicts import strong_conflict, weak_conflict, kv_conflict
 from core.fillers import pick_filler_actor
 from service.hash_utils import arrangement_hash, is_duplicate, register_hash
 from service.timing import measure_time
+from service.logger import get_logger
 
-log = logging.getLogger("stageflow.optimizer")
+log = get_logger("stageflow.optimizer")
 
 MAX_FILLERS_TOTAL = 3
 MAX_VARIANTS = 5
+MAX_TRIES = 1000
 
 
 # ============================================================
@@ -42,7 +43,7 @@ def _copy_block(block: Block) -> Block:
 
 
 def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
-    """Создаёт новый filler-блок между prev и nxt."""
+    """Создаёт filler между двумя номерами."""
     actor = Actor(actor_name)
     return Block(
         id=next_id,
@@ -60,227 +61,157 @@ def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Bloc
     )
 
 
-def _needs_filler(prev_perf: Optional[Block], cand: Block) -> Tuple[bool, bool]:
-    """Проверяет соседство двух performance-блоков."""
-    if prev_perf is None or cand.type != "performance":
-        return (False, False)
-    if strong_conflict(prev_perf, cand) or kv_conflict(prev_perf, cand):
-        return (True, False)
-    if weak_conflict(prev_perf, cand):
-        return (False, True)
-    return (False, False)
+def _count_weak_conflicts(blocks: List[Block]) -> int:
+    """Подсчёт слабых конфликтов между соседними номерами."""
+    count = 0
+    for i in range(len(blocks) - 1):
+        a, b = blocks[i], blocks[i + 1]
+        if a.type == "performance" and b.type == "performance":
+            if weak_conflict(a, b) or weak_conflict(b, a):
+                count += 1
+    return count
 
 
-def _last_performance(seq: List[Block]) -> Optional[Block]:
-    for b in reversed(seq):
-        if b.type == "performance":
-            return b
-    return None
+def _has_strong_conflicts(blocks: List[Block]) -> bool:
+    """Проверяет наличие сильных конфликтов между соседями."""
+    for i in range(len(blocks) - 1):
+        a, b = blocks[i], blocks[i + 1]
+        if a.type == "performance" and b.type == "performance":
+            if strong_conflict(a, b) or strong_conflict(b, a) or kv_conflict(a, b):
+                return True
+    return False
 
 
-# ============================================================
-# Dynamic ordering inside DFS
-# ============================================================
+def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Block]:
+    """Вставляет тянучки на местах слабых конфликтов."""
+    rng = random.Random(seed)
+    result: List[Block] = []
+    next_id = max((b.id for b in blocks), default=0) + 1
+    fillers_used = 0
 
-def _cand_penalty(prev_perf: Optional[Block], cand: Block, assembled: List[Block]) -> int:
-    """0 — если нет слабого конфликта с prev_perf, 1 — если есть."""
-    if prev_perf is None:
-        return 0
-    return 1 if (weak_conflict(prev_perf, cand) or weak_conflict(cand, prev_perf)) else 0
-
-
-def _sort_try_order(pool: List[Block], prev_perf: Optional[Block],
-                    assembled: List[Block], rng: random.Random) -> List[Block]:
-    """Сортирует кандидатов по конфликтности в текущем контексте."""
-    if not pool:
-        return []
-
-    def global_conf(b: Block) -> int:
-        K = 6  # глубина окна проверки
-        cnt = 0
-        seen = 0
-        for x in reversed(assembled):
-            if x.type == "performance":
-                cnt += 1 if (weak_conflict(x, b) or weak_conflict(b, x)) else 0
-                seen += 1
-                if seen >= K:
-                    break
-        return cnt
-
-    return sorted(
-        pool,
-        key=lambda b: (_cand_penalty(prev_perf, b, assembled),
-                       global_conf(b),
-                       rng.random())
-    )
+    for i, b in enumerate(blocks):
+        if result:
+            prev = result[-1]
+            if prev.type == "performance" and b.type == "performance":
+                if weak_conflict(prev, b):
+                    if fillers_used < max_fillers:
+                        actor_name = pick_filler_actor(prev, b, seed=seed ^ (i << 10))
+                        if actor_name:
+                            filler = _make_filler(prev, b, actor_name, next_id)
+                            next_id += 1
+                            result.append(filler)
+                            fillers_used += 1
+                        else:
+                            log.warning(f"⚠️ Не найден актёр для тянучки между '{prev.name}' и '{b.name}'")
+                    else:
+                        log.debug("🚫 Достигнут лимит тянучек (%d)", max_fillers)
+        result.append(b)
+    return result
 
 
 # ============================================================
-# Core algorithm
+# Core logic — Two-phase optimizer
 # ============================================================
 
 @measure_time("optimizer.stochastic_branch_and_bound")
 async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
     """
-    Формирует вариант программы.
-    Динамически минимизирует слабые конфликты.
-    Лимит тянучек: ≤ 3 в сумме (включая исходные).
+    Формирует вариант программы по двухфазной логике:
+    1️⃣ Перестановка без сильных конфликтов и с ≤ (3 - existing_fillers) слабых.
+    2️⃣ Вставка тянучек между оставшимися конфликтами.
     """
     rng = random.Random(seed)
-    seen_hashes: set[str] = set()
+    log.info("🧮 Оптимайзер запущен (seed=%s)", seed)
 
-    # 1️⃣ Учитываем уже существующие тянучки
+    # === Учитываем уже существующие тянучки ===
     existing_fillers = sum(1 for b in blocks if b.type == "filler")
-    allowed_to_insert = max(0, MAX_FILLERS_TOTAL - existing_fillers)
-    log.info(f"[SEED={seed}] исходных тянучек = {existing_fillers}, можно вставить ещё = {allowed_to_insert}")
+    max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing_fillers)
+    log.info(f"[SEED={seed}] исходных тянучек={existing_fillers}, допустимо слабых конфликтов={max_weak_allowed}")
 
-    # 2️⃣ Фиксация по правилам v2.4
-    for b in blocks:
-        if b.type in {"prelude", "sponsor"}:
-            b.fixed = True
-        if b.type == "filler":
-            b.fixed = True
-    perf_indices = [i for i, b in enumerate(blocks) if b.type == "performance"]
-    for i in perf_indices[:2]:
-        blocks[i].fixed = True
-    for i in perf_indices[-4:]:
-        blocks[i].fixed = True
-
-    # 3️⃣ Рабочие структуры
+    # === Фиксированные блоки ===
     base_seq: List[Block] = [_copy_block(b) for b in blocks]
-    fixed_positions = {i for i, b in enumerate(base_seq) if b.fixed}
-    fixed_at_index = {i: base_seq[i] for i in fixed_positions}
-    variable_pool: List[Block] = [b for b in base_seq
-                                  if (b.type == "performance" and not b.fixed)]
+    for b in base_seq:
+        if b.type in {"prelude", "sponsor"} or b.type == "filler":
+            b.fixed = True
+    perf_indices = [i for i, b in enumerate(base_seq) if b.type == "performance"]
+    for i in perf_indices[:2]:
+        base_seq[i].fixed = True
+    for i in perf_indices[-4:]:
+        base_seq[i].fixed = True
 
-    max_id = max((b.id for b in blocks), default=0)
-    next_new_id = max_id + 1
+    fixed_blocks = [b for b in base_seq if b.fixed]
+    movable_blocks = [b for b in base_seq if (b.type == "performance" and not b.fixed)]
 
-    best_arrangement: Optional[List[Block]] = None
-    best_fillers_used = 99
-    found_perfect = False
+    if not movable_blocks:
+        log.warning(f"⚠️ Все блоки фиксированы (seed={seed}), перестановка невозможна.")
+        return Arrangement(seed=seed, blocks=blocks, fillers_used=existing_fillers)
 
-    # ============================================================
-    # DFS
-    # ============================================================
+    # === Фаза 1: поиск перестановок ===
+    best_variant: Optional[List[Block]] = None
+    best_weak = 999
+    tries = 0
 
-    def dfs(pos: int, pool: List[Block], assembled: List[Block], fillers_used: int) -> None:
-        nonlocal best_arrangement, best_fillers_used, found_perfect, next_new_id
+    for attempt in range(1, MAX_TRIES + 1):
+        tries = attempt
+        shuffled = movable_blocks[:]
+        rng.shuffle(shuffled)
 
-        if fillers_used > allowed_to_insert:
-            return
-        if fillers_used >= best_fillers_used or found_perfect:
-            return
-
-        if pos == len(base_seq):
-            candidate = assembled.copy()
-            h = arrangement_hash(candidate)
-            if not is_duplicate(candidate, seen_hashes):
-                register_hash(candidate, seen_hashes)
-                best_arrangement = candidate
-                best_fillers_used = fillers_used
-                log.info(f"[RESULT] seed={seed} | вставлено тянучек={fillers_used} | hash={h[:8]}")
-                if best_fillers_used == 0:
-                    found_perfect = True
-            return
-
-        # ---- фиксированные позиции ----
-        if pos in fixed_positions:
-            cand = fixed_at_index[pos]
-            prev_perf = _last_performance(assembled)
-            forbid, need_fill = (False, False)
-
-            if cand.type == "performance":
-                # если уже стоит filler — не вставляем ещё
-                if prev_perf and assembled and assembled[-1].type == "filler":
-                    forbid, need_fill = (False, False)
-                else:
-                    forbid, need_fill = _needs_filler(prev_perf, cand)
-
-            if forbid:
-                return
-            if need_fill and fillers_used < allowed_to_insert:
-                actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 8))
-                if not actor_name:
-                    return
-                filler_block = _make_filler(prev_perf, cand, actor_name, next_new_id)
-                next_new_id += 1
-                assembled.append(filler_block)
-                assembled.append(cand)
-                dfs(pos + 1, pool, assembled, fillers_used + 1)
-                assembled.pop()
-                assembled.pop()
-                return
-
-            assembled.append(cand)
-            dfs(pos + 1, pool, assembled, fillers_used)
-            assembled.pop()
-            return
-
-        # ---- переставляемые позиции ----
-        prev_perf = _last_performance(assembled)
-        try_order = _sort_try_order(pool, prev_perf, assembled, rng)
-
-        for cand in try_order:
-            cur_prev = _last_performance(assembled)
-
-            # повторная проверка наличия filler перед _needs_filler
-            if cur_prev and assembled and assembled[-1].type == "filler":
-                forbid, need_fill = (False, False)
+        # Собираем полную последовательность с фиксами
+        new_order: List[Block] = []
+        m_idx = 0
+        for b in base_seq:
+            if b.fixed:
+                new_order.append(b)
             else:
-                forbid, need_fill = _needs_filler(cur_prev, cand)
+                new_order.append(shuffled[m_idx])
+                m_idx += 1
 
-            if forbid:
-                continue
+        # Проверяем конфликты
+        if _has_strong_conflicts(new_order):
+            continue
+        weak_cnt = _count_weak_conflicts(new_order)
+        if weak_cnt <= max_weak_allowed:
+            # если идеально (0 weak), сразу берём
+            if weak_cnt == 0:
+                best_variant = new_order
+                best_weak = 0
+                log.info(f"✅ Найден идеальный вариант без слабых конфликтов (seed={seed}, attempt={attempt})")
+                break
+            if weak_cnt < best_weak:
+                best_variant = new_order
+                best_weak = weak_cnt
 
-            if need_fill and fillers_used < allowed_to_insert:
-                actor_name = pick_filler_actor(cur_prev, cand, seed=seed ^ (pos << 12))
-                if not actor_name:
-                    continue
-                filler_block = _make_filler(cur_prev, cand, actor_name, next_new_id)
-                next_new_id += 1
-                assembled.append(filler_block)
-                assembled.append(cand)
-                new_pool = [b for b in pool if b is not cand]
-                # пересортировка кандидатов на новой глубине
-                dfs(pos + 1, new_pool, assembled, fillers_used + 1)
-                assembled.pop()
-                assembled.pop()
-            else:
-                assembled.append(cand)
-                new_pool = [b for b in pool if b is not cand]
-                dfs(pos + 1, new_pool, assembled, fillers_used)
-                assembled.pop()
+    # === Проверка результата ===
+    if not best_variant:
+        log.error(f"❌ Оптимайзер не смог найти допустимую перестановку (seed={seed}) после {MAX_TRIES} попыток.")
+        return Arrangement(seed=seed, blocks=blocks, fillers_used=existing_fillers)
 
-            if found_perfect:
-                return
+    log.info(f"✅ Найден вариант после {tries} попыток (weak={best_weak}, seed={seed})")
 
-    log.info(f"▶️ Start BnB (seed={seed}) | fixed={len(fixed_positions)} | variable={len(variable_pool)}")
-    dfs(0, variable_pool, [], 0)
-
-    # ============================================================
-    # Результат
-    # ============================================================
-    if best_arrangement is None:
-        log.warning(f"⚠️ Не удалось собрать вариант для seed={seed}. Возвращаю исходный порядок.")
-        return Arrangement(seed=seed, blocks=blocks, fillers_used=0)
+    # === Фаза 2: вставка тянучек ===
+    allowed_fillers = max(0, MAX_FILLERS_TOTAL - existing_fillers)
+    with_fillers = _insert_fillers(best_variant, allowed_fillers, seed)
 
     strong_cnt = sum(
-        strong_conflict(best_arrangement[i], best_arrangement[i + 1])
-        for i in range(len(best_arrangement) - 1)
+        strong_conflict(with_fillers[i], with_fillers[i + 1])
+        for i in range(len(with_fillers) - 1)
     )
-    weak_cnt = sum(
-        weak_conflict(best_arrangement[i], best_arrangement[i + 1])
-        for i in range(len(best_arrangement) - 1)
+    weak_cnt_final = sum(
+        weak_conflict(with_fillers[i], with_fillers[i + 1])
+        for i in range(len(with_fillers) - 1)
     )
 
-    log.info(f"✅ Done (seed={seed}) | вставлено тянучек={best_fillers_used} | total={len(best_arrangement)}")
+    log.info(
+        f"🎬 Итог: вставлено тянучек={len(with_fillers) - len(best_variant)} | "
+        f"сильных={strong_cnt} | слабых={weak_cnt_final}"
+    )
+
     return Arrangement(
         seed=seed,
-        blocks=best_arrangement,
-        fillers_used=best_fillers_used,
+        blocks=with_fillers,
+        fillers_used=(len(with_fillers) - len(best_variant)),
         strong_conflicts=strong_cnt,
-        weak_conflicts=weak_cnt,
+        weak_conflicts=weak_cnt_final,
     )
 
 

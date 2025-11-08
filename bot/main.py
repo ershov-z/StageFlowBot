@@ -130,7 +130,16 @@ async def handle_docx(message: types.Message):
         arrangements = await generate_arrangements(program.blocks)
         arrangements_json = user_dir / f"arrangements_{time.strftime('%H%M%S')}.json"
         await save_json([a.seed for a in arrangements], arrangements_json)
-        await message.answer(responses.OPTIMIZATION_DONE.format(count=len(arrangements)))
+
+        # --- анализ результатов оптимайзера ---
+        if not arrangements:
+            logger.error("❌ Оптимизация не удалась — допустимых перестановок нет.")
+            await message.answer(responses.OPTIMIZATION_FAILED)
+        elif all(a.weak_conflicts > 0 for a in arrangements):
+            logger.warning("⚠️ Оптимизация завершена частично — слабые конфликты остались.")
+            await message.answer(responses.OPTIMIZATION_PARTIAL)
+        else:
+            await message.answer(responses.OPTIMIZATION_DONE.format(count=len(arrangements)))
 
         # === 4️⃣ Валидация ===
         await message.answer(responses.VALIDATION_STARTED)
@@ -147,7 +156,6 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.EXPORT_STARTED)
         template_path = saved_path
 
-        # ✅ Исправлено: используем напрямую export_all без двойного архивирования
         zip_path = export_all(valid_arrangements, template_path, results_dir)
 
         await message.answer(responses.EXPORT_DONE)
@@ -204,7 +212,6 @@ async def keep_alive():
 # 🔧 Исправленный on_startup с очисткой URL
 # ============================================================
 async def on_startup(app):
-    # Даём Koyeb/Render время активировать домен
     await asyncio.sleep(10)
     base_url = (APP_URL or RENDER_HOSTNAME).replace("https://", "").strip().rstrip("/")
     webhook_url = f"https://{base_url}{WEBHOOK_PATH}"
