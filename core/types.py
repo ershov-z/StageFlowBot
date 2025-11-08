@@ -113,6 +113,7 @@ class Arrangement:
     fillers_used: int = 0
     strong_conflicts: int = 0
     weak_conflicts: int = 0
+    meta: Optional[dict] = None  # ← добавлено поле для статусов/служебных данных
 
     def __len__(self):
         return len(self.blocks)

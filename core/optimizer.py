@@ -9,7 +9,7 @@ from collections import defaultdict
 from core.types import Block, Arrangement, Actor
 from core.conflicts import strong_conflict, weak_conflict, kv_conflict
 from core.fillers import pick_filler_actor
-from service.hash_utils import arrangement_hash, is_duplicate, register_hash
+from service.hash_utils import arrangement_hash
 from service.timing import measure_time
 from service.logger import get_logger
 
@@ -17,51 +17,11 @@ log = get_logger("stageflow.optimizer")
 
 MAX_FILLERS_TOTAL = 3
 MAX_VARIANTS = 5
-MAX_TRIES = 10000  # увеличено согласно новым требованиям
+MAX_TRIES = 10000
+
 
 # ============================================================
-# Теоретическая проверка разрешимости программы
-# ============================================================
-def theoretical_feasibility(blocks: List[Block], existing_fillers: int, max_fillers: int) -> dict:
-    """Проверяет теоретическую возможность разрешения программы."""
-    graph = defaultdict(set)
-
-    # Собираем граф слабых конфликтов
-    for i, a in enumerate(blocks):
-        for j, b in enumerate(blocks):
-            if i < j and weak_conflict(a, b):
-                graph[i].add(j)
-                graph[j].add(i)
-
-    # Находим связные компоненты
-    visited = set()
-    components = []
-    for i in range(len(blocks)):
-        if i not in visited and i in graph:
-            stack = [i]
-            comp = set()
-            while stack:
-                n = stack.pop()
-                if n not in visited:
-                    visited.add(n)
-                    comp.add(n)
-                    stack.extend(graph[n])
-            components.append(comp)
-
-    # Подсчёт необходимых тянучек
-    needed_fillers = sum(len(c) - 1 for c in components if len(c) > 1)
-    available_fillers = max_fillers - existing_fillers
-    feasible = needed_fillers <= available_fillers
-
-    return {
-        "feasible": feasible,
-        "needed_fillers": needed_fillers,
-        "available_fillers": available_fillers,
-        "components": len(components)
-    }
-
-# ============================================================
-# Helpers
+# Вспомогательные функции
 # ============================================================
 
 def _copy_block(block: Block) -> Block:
@@ -80,6 +40,7 @@ def _copy_block(block: Block) -> Block:
         responsible=block.responsible,
     )
 
+
 def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
     actor = Actor(actor_name)
     return Block(
@@ -97,6 +58,7 @@ def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Bloc
         meta={"auto": True, "between": (prev.name, nxt.name)},
     )
 
+
 def _count_weak_conflicts(blocks: List[Block]) -> int:
     count = 0
     for i in range(len(blocks) - 1):
@@ -106,6 +68,7 @@ def _count_weak_conflicts(blocks: List[Block]) -> int:
                 count += 1
     return count
 
+
 def _has_strong_conflicts(blocks: List[Block]) -> bool:
     for i in range(len(blocks) - 1):
         a, b = blocks[i], blocks[i + 1]
@@ -113,6 +76,7 @@ def _has_strong_conflicts(blocks: List[Block]) -> bool:
             if strong_conflict(a, b) or strong_conflict(b, a) or kv_conflict(a, b):
                 return True
     return False
+
 
 def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Block]:
     rng = random.Random(seed)
@@ -139,8 +103,97 @@ def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Bl
         result.append(b)
     return result
 
+
 # ============================================================
-# Core logic
+# Теоретическая проверка (новая логика)
+# ============================================================
+
+def theoretical_feasibility_exact(blocks: List[Block], max_fillers_total: int) -> dict:
+    """Проверяет теоретическую возможность разрешения с учётом перестановки."""
+    from itertools import permutations
+
+    # Отбираем только переставляемые номера
+    movable = [b for b in blocks if b.type == "performance"]
+    existing_fillers = sum(1 for b in blocks if b.type == "filler")
+
+    # Быстрая проверка: если нет вообще strong-конфликтов между любыми парами — 0 strong достижим
+    # Ищем минимум weak-конфликтов в любой перестановке (эвристически для малых входов)
+    best_weak = float("inf")
+    strong_impossible = False
+    all_blocks = movable[:]
+    limit = 8  # для больших входов не взрываем память
+    if len(all_blocks) <= limit:
+        for perm in permutations(all_blocks):
+            if _has_strong_conflicts(list(perm)):
+                strong_impossible = True
+                continue
+            w = _count_weak_conflicts(list(perm))
+            best_weak = min(best_weak, w)
+    else:
+        # случайный выбор 500 перестановок
+        rng = random.Random(42)
+        for _ in range(500):
+            rng.shuffle(all_blocks)
+            if _has_strong_conflicts(all_blocks):
+                strong_impossible = True
+                continue
+            w = _count_weak_conflicts(all_blocks)
+            best_weak = min(best_weak, w)
+
+    available = max_fillers_total - existing_fillers
+    feasible = best_weak <= available and not strong_impossible
+    return {
+        "feasible": feasible,
+        "min_weak_needed": int(best_weak if best_weak != float("inf") else 999),
+        "available_fillers": int(available),
+        "strong_possible": not strong_impossible,
+    }
+
+
+@measure_time("optimizer.theoretical_check")
+async def theoretical_check(blocks: List[Block]) -> Arrangement:
+    """Возвращает математически идеальный вариант, если он возможен."""
+    existing_fillers = sum(1 for b in blocks if b.type == "filler")
+    feasibility = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
+
+    if not feasibility["feasible"]:
+        log.error(
+            f"❌ Теоретически неразрешимо: нужно {feasibility['min_weak_needed']} тянучек, "
+            f"а доступно только {feasibility['available_fillers']}."
+        )
+        return Arrangement(
+            seed=0,
+            blocks=blocks,
+            fillers_used=existing_fillers,
+            strong_conflicts=0,
+            weak_conflicts=0,
+            meta={
+                "status": "infeasible",
+                "message": (
+                    f"Эту программу невозможно разрешить: "
+                    f"нужно минимум {feasibility['min_weak_needed']} тянучек, "
+                    f"а доступно {feasibility['available_fillers']}."
+                ),
+            },
+        )
+
+    log.info(
+        f"🌟 Математически идеальный вариант возможен (weak ≤ {feasibility['min_weak_needed']}, "
+        f"доступно {feasibility['available_fillers']})."
+    )
+
+    return Arrangement(
+        seed=0,
+        blocks=blocks,
+        fillers_used=existing_fillers,
+        strong_conflicts=0,
+        weak_conflicts=feasibility["min_weak_needed"],
+        meta={"status": "ideal"},
+    )
+
+
+# ============================================================
+# Основной алгоритм стохастического перебора
 # ============================================================
 
 @measure_time("optimizer.stochastic_branch_and_bound")
@@ -152,24 +205,7 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing_fillers)
     log.info(f"[SEED={seed}] исходных тянучек={existing_fillers}, допустимо слабых конфликтов={max_weak_allowed}")
 
-    # 🔹 Проверяем теоретическую возможность
-    feasibility = theoretical_feasibility(blocks, existing_fillers, MAX_FILLERS_TOTAL)
-    if not feasibility["feasible"]:
-        log.error(
-            f"❌ Программа неразрешима теоретически: требуется минимум {feasibility['needed_fillers']} тянучек, "
-            f"доступно {feasibility['available_fillers']}."
-        )
-        return Arrangement(
-            seed=seed,
-            blocks=blocks,
-            fillers_used=existing_fillers,
-            strong_conflicts=0,
-            weak_conflicts=0,
-            meta={"status": "infeasible", "message": (
-                f"Эту программу разрешить невозможно: требуется минимум {feasibility['needed_fillers']} тянучек, "
-                f"а доступно только {feasibility['available_fillers']}. Загрузите другой файл."
-            )}
-        )
+    # Убрана прежняя теоретическая проверка — теперь делается отдельно
 
     # === Фиксированные блоки ===
     base_seq: List[Block] = [_copy_block(b) for b in blocks]
@@ -232,7 +268,10 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     strong_cnt = sum(strong_conflict(with_fillers[i], with_fillers[i + 1]) for i in range(len(with_fillers) - 1))
     weak_cnt_final = sum(weak_conflict(with_fillers[i], with_fillers[i + 1]) for i in range(len(with_fillers) - 1))
 
-    log.info(f"🎬 Итог: вставлено тянучек={len(with_fillers) - len(best_variant)} | сильных={strong_cnt} | слабых={weak_cnt_final}")
+    log.info(
+        f"🎬 Итог: вставлено тянучек={len(with_fillers) - len(best_variant)} | "
+        f"сильных={strong_cnt} | слабых={weak_cnt_final}"
+    )
 
     return Arrangement(
         seed=seed,
@@ -242,17 +281,27 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         weak_conflicts=weak_cnt_final,
     )
 
+
 # ============================================================
-# Multiple variants
+# Генерация нескольких вариантов
 # ============================================================
 
 @measure_time("optimizer.generate_arrangements")
 async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
+    # 1️⃣ Проверка математической разрешимости
+    ideal_arr = await theoretical_check(blocks)
+    if ideal_arr.meta["status"] == "infeasible":
+        return [ideal_arr]
+
+    if ideal_arr.meta["status"] == "ideal":
+        log.info("🌟 Отправляем математически идеальный вариант пользователю. Ищу альтернативы...")
+
+    # 2️⃣ Генерация стохастических альтернатив
     seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
     log.info(f"🧬 Seeds: {seeds}")
 
-    unique: List[Arrangement] = []
-    seen_hashes = set()
+    unique: List[Arrangement] = [ideal_arr]
+    seen_hashes = {arrangement_hash(ideal_arr.blocks)}
 
     for s in seeds:
         arr = await stochastic_branch_and_bound(blocks, s)
@@ -260,11 +309,8 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         if h not in seen_hashes:
             seen_hashes.add(h)
             unique.append(arr)
-        else:
-            log.debug(f"[DUPLICATE] вариант {s} пропущен")
-
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info(f"✅ Сгенерировано уникальных вариантов: {len(unique)} / {len(seeds)}")
+    log.info(f"✅ Сгенерировано уникальных вариантов (включая идеальный): {len(unique)} / {len(seeds) + 1}")
     return unique

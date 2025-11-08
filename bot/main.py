@@ -123,32 +123,33 @@ async def handle_docx(message: types.Message):
             caption="🧾 Распарсенный JSON (исходная таблица).",
         )
 
-        # === 3️⃣ Генерация ===
+        # === 3️⃣ Оптимизация ===
         await message.answer(responses.OPTIMIZATION_STARTED)
         arrangements = await generate_arrangements(program.blocks)
 
-        # Проверяем: если программа неразрешима (infeasible)
-        if arrangements and hasattr(arrangements[0], "meta") and arrangements[0].meta and arrangements[0].meta.get("status") == "infeasible":
-            msg = arrangements[0].meta.get("message") or "Эту программу разрешить невозможно. Загрузите другой файл."
-            needed = arrangements[0].meta.get("needed_fillers", "?")
-            available = arrangements[0].meta.get("available_fillers", "?")
-            await message.answer(responses.OPTIMIZATION_INFEASIBLE.format(needed=needed, available=available))
-            logger.warning(f"🚫 Программа неразрешима для пользователя {user_id}: {msg}")
-            return
-
-        arrangements_json = user_dir / f"arrangements_{time.strftime('%H%M%S')}.json"
-        await save_json([a.seed for a in arrangements], arrangements_json)
-
-        # --- анализ результатов оптимайзера ---
-        if not arrangements:
-            logger.error("❌ Оптимизация не удалась — допустимых перестановок нет.")
+        # === Проверка результата ===
+        first = arrangements[0] if arrangements else None
+        if not first:
             await message.answer(responses.OPTIMIZATION_FAILED)
+            logger.warning(f"❌ Не найдено допустимых вариантов (user={user_id})")
             return
-        elif all(a.weak_conflicts > 0 for a in arrangements):
-            logger.warning("⚠️ Оптимизация завершена частично — слабые конфликты остались.")
-            await message.answer(responses.OPTIMIZATION_PARTIAL)
-        else:
-            await message.answer(responses.OPTIMIZATION_DONE.format(count=len(arrangements)))
+
+        # 3.1 Неразрешимая программа
+        if first.meta and first.meta.get("status") == "infeasible":
+            needed = first.meta.get("min_weak_needed", "?")
+            available = first.meta.get("available_fillers", "?")
+            await message.answer(
+                responses.OPTIMIZATION_INFEASIBLE.format(needed=needed, available=available)
+            )
+            logger.warning(f"🚫 Программа неразрешима для {user_id}: требуется {needed}, доступно {available}")
+            return
+
+        # 3.2 Математически идеальный вариант
+        if first.meta and first.meta.get("status") == "ideal":
+            await message.answer(responses.OPTIMIZATION_IDEAL_FOUND)
+            logger.info(f"🌟 Идеальный вариант найден и отправлен пользователю {user_id}")
+
+        await message.answer(responses.OPTIMIZATION_DONE.format(count=len(arrangements)))
 
         # === 4️⃣ Валидация ===
         await message.answer(responses.VALIDATION_STARTED)
@@ -161,10 +162,9 @@ async def handle_docx(message: types.Message):
             await message.answer("⚠️ Не найдено валидных вариантов. Использую лучший найденный.")
             valid_arrangements = arrangements[:1]
 
-        # === 5️⃣ Экспорт и упаковка ===
+        # === 5️⃣ Экспорт ===
         await message.answer(responses.EXPORT_STARTED)
         template_path = saved_path
-
         zip_path = export_all(valid_arrangements, template_path, results_dir)
 
         await message.answer(responses.EXPORT_DONE)
