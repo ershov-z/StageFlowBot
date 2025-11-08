@@ -174,6 +174,8 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
                     f"нужно минимум {feasibility['min_weak_needed']} тянучек, "
                     f"а доступно {feasibility['available_fillers']}."
                 ),
+                "min_weak_needed": feasibility["min_weak_needed"],       # ✅ добавлено
+                "available_fillers": feasibility["available_fillers"],   # ✅ добавлено
             },
         )
 
