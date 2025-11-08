@@ -32,11 +32,11 @@ def validate_arrangement(blocks: list[Block]) -> bool:
     for i in range(len(blocks) - 1):
         a, b = blocks[i], blocks[i + 1]
 
-        # Пропускаем любые проверки между filler-блоками
+        # --- пропускаем проверки между filler-блоками ---
         if a.type == "filler" or b.type == "filler":
             continue
 
-        # === Сильные конфликты ===
+        # === сильные конфликты ===
         if a.type == "performance" and b.type == "performance":
             if strong_conflict(a, b):
                 log.error(f"❌ Сильный конфликт между '{a.name}' и '{b.name}'")
@@ -45,18 +45,11 @@ def validate_arrangement(blocks: list[Block]) -> bool:
                 log.error(f"❌ kv:true подряд ('{a.name}' и '{b.name}')")
                 ok = False
 
-        # === Слабые конфликты без тянучки ===
-        # Если между performance-блоками НЕТ filler'а, проверяем weak_conflict
-        if a.type == "performance":
-            # Ищем ближайший следующий performance
-            j = i + 1
-            while j < len(blocks) and blocks[j].type == "filler":
-                j += 1
-            if j < len(blocks):
-                next_perf = blocks[j]
-                if next_perf.type == "performance" and weak_conflict(a, next_perf):
-                    log.error(f"❌ Слабый конфликт без тянучки: '{a.name}' → '{next_perf.name}'")
-                    ok = False
+        # === слабые конфликты без тянучки ===
+        if a.type == "performance" and b.type == "performance":
+            if weak_conflict(a, b):
+                log.error(f"❌ Слабый конфликт без тянучки: '{a.name}' ↔ '{b.name}'")
+                ok = False
 
     # ------------------ 3. Проверка порядка фиксированных ------------------
     fixed_blocks = [(i, b) for i, b in enumerate(blocks) if b.fixed]
