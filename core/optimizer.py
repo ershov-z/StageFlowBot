@@ -75,6 +75,7 @@ def _needs_filler(prev_perf: Optional[Block], cand: Block) -> Tuple[bool, bool]:
 
 
 def _last_performance(seq: List[Block]) -> Optional[Block]:
+    """Возвращает последний performance в последовательности."""
     for b in reversed(seq):
         if b.type == "performance":
             return b
@@ -95,37 +96,37 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     rng = random.Random(seed)
     seen_hashes: set[str] = set()
 
-    # ------------------------------------------------------------------
-    # 🔒 ДОСБОРКА ПРАВИЛ ФИКСАЦИИ (v2.4):
-    # фиксируем: предкулисье; первые 2 номера + их тянучки;
-    # последние 4 номера + их тянучки; спонсоры.
-    # Делаем это ДО сборки списков fixed_positions / variable_pool,
-    # чтобы флаги fixed корректно попали в рабочую копию. :contentReference[oaicite:1]{index=1}
-    # ------------------------------------------------------------------
-    # 1) заранее фиксируем типовые блоки
+    # --------------------------------------------------------
+    # 🔢 Учитываем уже существующие тянучки
+    # --------------------------------------------------------
+    existing_fillers = sum(1 for b in blocks if b.type == "filler")
+    allowed_to_insert = max(0, MAX_FILLERS - existing_fillers)
+    log.info(f"[SEED={seed}] исходных тянучек={existing_fillers}, можно вставить ещё={allowed_to_insert}")
+
+    # --------------------------------------------------------
+    # 🔒 ДОСБОРКА ПРАВИЛ ФИКСАЦИИ (v2.4)
+    # --------------------------------------------------------
     for b in blocks:
         if b.type in {"prelude", "sponsor"}:
             b.fixed = True
 
-    # 2) найдём индексы всех performance
     perf_indices = [i for i, b in enumerate(blocks) if b.type == "performance"]
 
-    # 3) фиксируем первые 2 и последние 4 performance (если они есть)
     for i in perf_indices[:2]:
         blocks[i].fixed = True
     for i in perf_indices[-4:]:
         blocks[i].fixed = True
 
-    # 4) фиксируем тянучки, которые находятся МЕЖДУ уже фиксированными блоками
     for i, b in enumerate(blocks):
         if b.type == "filler":
             prev_fixed = (i > 0) and blocks[i - 1].fixed
             next_fixed = (i < len(blocks) - 1) and blocks[i + 1].fixed
             if prev_fixed and next_fixed:
                 b.fixed = True
-    # ------------------------------------------------------------------
 
-    # Рабочая копия блоков (filler не переставляем)
+    # --------------------------------------------------------
+    # 🧱 Подготовка для перебора
+    # --------------------------------------------------------
     base_seq: List[Block] = [_copy_block(b) for b in blocks if b.type != "filler"]
     fixed_positions = {i for i, b in enumerate(base_seq) if b.fixed}
     fixed_at_index = {i: base_seq[i] for i in fixed_positions}
@@ -140,10 +141,19 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
 
     rng.shuffle(variable_pool)
 
+    # --------------------------------------------------------
+    # 🌲 DFS (перебор с отсечениями)
+    # --------------------------------------------------------
     def dfs(pos: int, pool: List[Block], assembled: List[Block], fillers_used: int) -> None:
         nonlocal best_arrangement, best_fillers_used, found_perfect, next_new_id
-        if fillers_used >= best_fillers_used or fillers_used > MAX_FILLERS or found_perfect:
+
+        # Проверка лимитов
+        if fillers_used > allowed_to_insert:
             return
+        if fillers_used >= best_fillers_used or found_perfect:
+            return
+
+        # База рекурсии — дошли до конца
         if pos == len(base_seq):
             candidate = assembled.copy()
             h = arrangement_hash(candidate)
@@ -151,20 +161,21 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                 register_hash(candidate, seen_hashes)
                 best_arrangement = candidate
                 best_fillers_used = fillers_used
-                log.info(f"[RESULT] seed={seed} | fillers={fillers_used} | hash={h[:8]}")
+                log.info(f"[RESULT] seed={seed} | вставлено_тянучек={fillers_used} | hash={h[:8]}")
                 if best_fillers_used == 0:
                     found_perfect = True
             return
 
+        # === Фиксированные блоки ===
         if pos in fixed_positions:
             cand = fixed_at_index[pos]
             prev_perf = _last_performance(assembled)
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 return
-            # === изменено: строго отсекаем ветку, если filler обязателен, а лимит исчерпан
+
             if need_fill:
-                if fillers_used < MAX_FILLERS:
+                if fillers_used < allowed_to_insert:
                     actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 8))
                     if not actor_name:
                         return
@@ -183,16 +194,18 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                 assembled.pop()
             return
 
+        # === Переставляемые блоки ===
         try_order = pool.copy()
         rng.shuffle(try_order)
+
         for cand in try_order:
             prev_perf = _last_performance(assembled)
             forbid, need_fill = _needs_filler(prev_perf, cand)
             if forbid:
                 continue
-            # === изменено: строго отсекаем ветку, если filler обязателен, а лимит исчерпан
+
             if need_fill:
-                if fillers_used < MAX_FILLERS:
+                if fillers_used < allowed_to_insert:
                     actor_name = pick_filler_actor(prev_perf, cand, seed=seed ^ (pos << 12))
                     if not actor_name:
                         continue
@@ -211,23 +224,29 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                 new_pool = [b for b in pool if b is not cand]
                 dfs(pos + 1, new_pool, assembled, fillers_used)
                 assembled.pop()
+
             if found_perfect:
                 return
 
+    # --------------------------------------------------------
+    # ▶️ Запуск DFS
+    # --------------------------------------------------------
     log.info(f"▶️ Start BnB (seed={seed}) | fixed={len(fixed_positions)} | variable={len(variable_pool)}")
     dfs(0, variable_pool, [], 0)
 
+    # --------------------------------------------------------
+    # 🧾 Завершение
+    # --------------------------------------------------------
     if best_arrangement is None:
         log.warning(f"⚠️ Не удалось собрать вариант для seed={seed}. Возвращаю исходный порядок.")
         return Arrangement(seed=seed, blocks=blocks, fillers_used=0)
 
-    # Финальная проверка конфликтов
     strong_cnt = sum(strong_conflict(best_arrangement[i], best_arrangement[i + 1])
                      for i in range(len(best_arrangement) - 1))
     weak_cnt = sum(weak_conflict(best_arrangement[i], best_arrangement[i + 1])
                    for i in range(len(best_arrangement) - 1))
 
-    log.info(f"✅ Done (seed={seed}) | fillers={best_fillers_used} | total={len(best_arrangement)}")
+    log.info(f"✅ Done (seed={seed}) | вставлено_тянучек={best_fillers_used} | total={len(best_arrangement)}")
     return Arrangement(
         seed=seed,
         blocks=best_arrangement,
@@ -247,14 +266,11 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
     seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
     log.info(f"🧬 Seeds: {seeds}")
 
-    # PERF: последовательная генерация вместо параллельной — экономим CPU/RAM на слабых инстансах.
     unique: List[Arrangement] = []
     seen_hashes = set()
 
     for s in seeds:
         arr = await stochastic_branch_and_bound(blocks, s)
-
-        # Онлайновая фильтрация дублей (как раньше, но без накопления всего списка results)
         h = arrangement_hash(arr.blocks)
         if h not in seen_hashes:
             seen_hashes.add(h)
@@ -262,7 +278,6 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         else:
             log.debug(f"[DUPLICATE] вариант {arr.seed} пропущен")
 
-        # Даём циклу событий подышать и просим GC освободить память от временных структур
         await asyncio.sleep(0)
         gc.collect()
 
