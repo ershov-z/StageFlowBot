@@ -120,7 +120,7 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     rng = random.Random(seed)
     seen_hashes: set[str] = set()
 
-    # 1️⃣ Подсчёт уже существующих тянучек
+    # 1️⃣ Подсчёт уже существующих тянучек (входные фиксированные тоже считаются)
     existing_fillers = sum(1 for b in blocks if b.type == "filler")
     allowed_to_insert = max(0, MAX_FILLERS_TOTAL - existing_fillers)
     log.info(f"[SEED={seed}] исходных тянучек={existing_fillers}, можно вставить ещё={allowed_to_insert}")
@@ -177,13 +177,19 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
                     found_perfect = True
             return
 
-        # фиксированные позиции
+        # ---------- фиксированные позиции ----------
         if pos in fixed_positions:
             cand = fixed_at_index[pos]
             prev_perf = _last_performance(assembled)
+
             forbid, need_fill = (False, False)
             if cand.type == "performance":
-                forbid, need_fill = _needs_filler(prev_perf, cand)
+                # 🔒 ФИКС: если последний уже добавленный блок — тянучка, вторую не вставляем
+                if prev_perf and assembled and assembled[-1].type == "filler":
+                    forbid, need_fill = (False, False)
+                    log.debug(f"[SKIP EXTRA FILLER] уже есть filler между '{prev_perf.name}' и фикс. '{cand.name}'")
+                else:
+                    forbid, need_fill = _needs_filler(prev_perf, cand)
 
             if forbid:
                 return
@@ -205,13 +211,19 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
             assembled.pop()
             return
 
-        # переставляемые блоки
+        # ---------- переставляемые позиции ----------
         try_order = pool.copy()
         rng.shuffle(try_order)
 
         for cand in try_order:
             prev_perf = _last_performance(assembled)
-            forbid, need_fill = _needs_filler(prev_perf, cand)
+
+            # 🔒 ФИКС: не вставляем вторую тянучку подряд
+            if prev_perf and assembled and assembled[-1].type == "filler":
+                forbid, need_fill = (False, False)
+            else:
+                forbid, need_fill = _needs_filler(prev_perf, cand)
+
             if forbid:
                 continue
 
