@@ -23,10 +23,10 @@ from core.exporter import export_all_variants as export_all
 from bot import responses
 from bot.file_manager import (
     save_uploaded_file,
-    cleanup_temp,
-    get_user_dir,
-    get_results_dir,
-    save_json,
+    cleanup_user_workspace,
+    results_dir_for,
+    uploads_dir_for,
+    write_text,
 )
 
 # --- service utils ---
@@ -88,12 +88,15 @@ async def handle_docx(message: types.Message):
     await message.answer(responses.FILE_RECEIVED.format(name=document.file_name))
     await message.answer(responses.PARSING_STARTED)
 
-    user_dir = get_user_dir(WORK_DIR, user_id)
-    results_dir = get_results_dir(user_dir)
+    user_dir = uploads_dir_for(user_id)
+    results_dir = results_dir_for(user_id)
 
     try:
         # === 1️⃣ Сохраняем исходный файл ===
-        saved_path = await save_uploaded_file(bot, document, user_dir)
+        file = await bot.get_file(document.file_id)
+        file_path = await bot.download_file(file.file_path)
+        src_path = Path(file_path.name)
+        saved_path = save_uploaded_file(src_path, user_id, document.file_name)
         logger.info(f"📥 Получен файл: {saved_path}")
 
         # === 2️⃣ Парсинг ===
@@ -116,7 +119,8 @@ async def handle_docx(message: types.Message):
             }
             for b in program.blocks
         ]
-        await save_json(parsed_payload, parsed_json_path)
+
+        write_text(user_id, f"parsed_{time.strftime('%H%M%S')}.json", json.dumps(parsed_payload, ensure_ascii=False, indent=2))
         await message.answer(responses.PARSING_DONE)
         await message.answer_document(
             FSInputFile(parsed_json_path),
@@ -127,14 +131,12 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.OPTIMIZATION_STARTED)
         arrangements = await generate_arrangements(program.blocks)
 
-        # === Проверка результата ===
         first = arrangements[0] if arrangements else None
         if not first:
             await message.answer(responses.OPTIMIZATION_FAILED)
             logger.warning(f"❌ Не найдено допустимых вариантов (user={user_id})")
             return
 
-        # 3.1 Неразрешимая программа
         if first.meta and first.meta.get("status") == "infeasible":
             needed = first.meta.get("min_weak_needed", "?")
             available = first.meta.get("available_fillers", "?")
@@ -144,7 +146,6 @@ async def handle_docx(message: types.Message):
             logger.warning(f"🚫 Программа неразрешима для {user_id}: требуется {needed}, доступно {available}")
             return
 
-        # 3.2 Математически идеальный вариант
         if first.meta and first.meta.get("status") == "ideal":
             await message.answer(responses.OPTIMIZATION_IDEAL_FOUND)
             logger.info(f"🌟 Идеальный вариант найден и отправлен пользователю {user_id}")
@@ -155,7 +156,7 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.VALIDATION_STARTED)
         valid_arrangements = [a for a in arrangements if validate_arrangement(a.blocks)]
         valid_json = user_dir / f"validated_{time.strftime('%H%M%S')}.json"
-        await save_json([a.seed for a in valid_arrangements], valid_json)
+        write_text(user_id, f"validated_{time.strftime('%H%M%S')}.json", json.dumps([a.seed for a in valid_arrangements], ensure_ascii=False, indent=2))
         await message.answer(responses.VALIDATION_DONE.format(count=len(valid_arrangements)))
 
         if not valid_arrangements:
@@ -164,8 +165,7 @@ async def handle_docx(message: types.Message):
 
         # === 5️⃣ Экспорт ===
         await message.answer(responses.EXPORT_STARTED)
-        template_path = saved_path
-        zip_path = export_all(valid_arrangements, template_path, results_dir)
+        zip_path = export_all(valid_arrangements, results_dir)
 
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
@@ -178,13 +178,13 @@ async def handle_docx(message: types.Message):
     except Exception as e:
         logger.exception(f"Ошибка при обработке файла: {e}")
         error_path = user_dir / f"error_{time.strftime('%H%M%S')}.json"
-        await save_json({"error": str(e)}, error_path)
+        write_text(user_id, f"error_{time.strftime('%H%M%S')}.json", json.dumps({"error": str(e)}, ensure_ascii=False, indent=2))
         await message.answer(responses.ERROR_MESSAGE.format(error=e))
         await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
 
     finally:
         try:
-            await cleanup_temp(user_dir, keep_results=True)
+            cleanup_user_workspace(user_id)
         except Exception as e:
             logger.warning(f"Не удалось очистить временные файлы: {e}")
 
