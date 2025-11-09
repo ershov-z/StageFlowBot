@@ -212,6 +212,19 @@ def _has_strong_conflicts(blocks: List[Block]) -> bool:
     return False
 
 
+def _count_conflicts(blocks: List[Block]) -> Tuple[int, int]:
+    strong_cnt = 0
+    weak_cnt = 0
+    for i in range(len(blocks) - 1):
+        a, b = blocks[i], blocks[i + 1]
+        if a.type == b.type == "performance":
+            if strong_conflict(a, b) or kv_conflict(a, b):
+                strong_cnt += 1
+            elif weak_conflict(a, b):
+                weak_cnt += 1
+    return strong_cnt, weak_cnt
+
+
 # ============================================================
 # Теоретическая проверка
 # ============================================================
@@ -228,16 +241,7 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
     allowed_new = MAX_FILLERS_TOTAL
     with_fillers = _insert_fillers(order, allowed_new, seed=0)
 
-    strong_cnt = sum(
-        (strong_conflict(with_fillers[i], with_fillers[i + 1]) or kv_conflict(with_fillers[i], with_fillers[i + 1]))
-        for i in range(len(with_fillers) - 1)
-        if with_fillers[i].type == with_fillers[i + 1].type == "performance"
-    )
-    weak_cnt = sum(
-        weak_conflict(with_fillers[i], with_fillers[i + 1])
-        for i in range(len(with_fillers) - 1)
-        if with_fillers[i].type == with_fillers[i + 1].type == "performance"
-    )
+    strong_cnt, weak_cnt = _count_conflicts(with_fillers)
 
     log.info(f"🌟 Математический идеал: слабых={min_weak} → вставлено тянучек={len(with_fillers) - len(order)}")
     return Arrangement(
@@ -298,5 +302,81 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info(f"✅ Сгенерировано вариантов: идеальных={len([r for r in results if str(r.meta.get('status', '')).lower() == 'ideal'])}, стохастических={len(results)-1}")
+    ideal_generated = sum(
+        1 for r in results if str(r.meta.get("status", "")).lower() == "ideal"
+    )
+    stochastic_generated = len(results) - ideal_generated
+    log.info(
+        "✅ Сгенерировано вариантов: идеальных=%s, стохастических=%s",
+        ideal_generated,
+        stochastic_generated,
+    )
     return results
+
+
+@measure_time("optimizer.stochastic_branch_and_bound")
+async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
+    """Стохастический перебор перестановок с сохранением лучших по конфликтам."""
+
+    rng = random.Random(seed)
+    template = [_copy_block(b) for b in blocks]
+    movable_idx = [
+        i for i, block in enumerate(template) if block.type == "performance" and not block.fixed
+    ]
+    movable_blocks = [template[i] for i in movable_idx]
+
+    best_candidate = list(template)
+    best_score = (float("inf"), float("inf"))
+    best_attempt = 0
+
+    if not movable_idx:
+        best_score = _count_conflicts(best_candidate)
+    else:
+        for attempt in range(1, MAX_TRIES + 1):
+            permuted = rng.sample(movable_blocks, len(movable_blocks))
+            candidate = list(template)
+            for idx, block in zip(movable_idx, permuted):
+                candidate[idx] = block
+
+            score = _count_conflicts(candidate)
+            if score < best_score:
+                best_candidate = [_copy_block(b) for b in candidate]
+                best_score = score
+                best_attempt = attempt
+
+            if score[0] == 0 and score[1] == 0:
+                break
+
+            if attempt % 128 == 0:
+                await asyncio.sleep(0)
+
+    base_arrangement = [_copy_block(b) for b in best_candidate]
+    with_fillers = _insert_fillers(base_arrangement, MAX_FILLERS_TOTAL, seed)
+    strong_cnt, weak_cnt = _count_conflicts(with_fillers)
+
+    fillers_used = len(with_fillers) - len(base_arrangement)
+
+    log.debug(
+        "🎲 Стохастика seed=%s: strong=%s, weak=%s, fillers=%s, attempts=%s",
+        seed,
+        strong_cnt,
+        weak_cnt,
+        fillers_used,
+        best_attempt,
+    )
+
+    return Arrangement(
+        seed=seed,
+        blocks=with_fillers,
+        fillers_used=fillers_used,
+        strong_conflicts=strong_cnt,
+        weak_conflicts=weak_cnt,
+        meta={
+            "status": "stochastic",
+            "attempt": best_attempt,
+            "score": {
+                "strong": best_score[0],
+                "weak": best_score[1],
+            },
+        },
+    )
