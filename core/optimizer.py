@@ -45,16 +45,28 @@ def _copy_block(block: Block) -> Block:
 
 def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Block:
     actor = Actor(actor_name)
+    name = "Тянучка"
+
+    # Раскладываем актёров по колонкам так же, как это делается вручную:
+    # Пушкин и Пятков относятся к колонке «ПП», остальные остаются в «Актёрах».
+    pp_names = {"Пушкин", "Пятков"}
+    if actor_name in pp_names:
+        actors_raw = ""
+        pp_raw = actor_name
+    else:
+        actors_raw = actor_name
+        pp_raw = ""
+
     return Block(
         id=next_id,
-        name=f"[filler] {actor_name}",
+        name=name,
         type="filler",
         actors=[actor],
         kv=False,
         fixed=False,
         num="",
-        actors_raw=actor_name,
-        pp_raw="",
+        actors_raw=actors_raw,
+        pp_raw=pp_raw,
         hire="",
         responsible="",
         kv_raw="",
