@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import asyncio
 import random
@@ -95,9 +96,9 @@ def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Bl
                         res.append(filler)
                         used += 1
                     else:
-                        log.warning(f"⚠️ Нет актёра для тянучки между '{prev.name}' и '{b.name}'")
+                        log.warning(f"\u26a0\ufe0f Нет актёра для тянучки между '{prev.name}' и '{b.name}'")
                 else:
-                    log.debug("🚫 Лимит тянучек достигнут (%d)", max_fillers)
+                    log.debug("\ud83d\udeab Лимит тянучек достигнут (%d)", max_fillers)
         res.append(b)
     return res
 
@@ -356,6 +357,46 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
 
 
 # ============================================================
+# Построение "идеального" варианта по _build_ideal_order, с управлением seed
+# ============================================================
+
+async def _build_ideal_variant(blocks: List[Block], seed: int) -> Arrangement:
+    feas = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
+    if not feas["feasible"]:
+        return Arrangement(
+            seed=seed,
+            blocks=blocks,
+            fillers_used=feas["existing_fillers"],
+            strong_conflicts=0,
+            weak_conflicts=0,
+            meta={"status": "infeasible"},
+        )
+    base_order = feas["order"]
+    allowed_new = feas["available_fillers"]
+    with_fillers = _insert_fillers(base_order, allowed_new, seed)
+
+    strong_cnt = sum(
+        (strong_conflict(with_fillers[i], with_fillers[i + 1]) or kv_conflict(with_fillers[i], with_fillers[i + 1]))
+        for i in range(len(with_fillers) - 1)
+        if with_fillers[i].type == with_fillers[i + 1].type == "performance"
+    )
+    weak_cnt = sum(
+        weak_conflict(with_fillers[i], with_fillers[i + 1])
+        for i in range(len(with_fillers) - 1)
+        if with_fillers[i].type == with_fillers[i + 1].type == "performance"
+    )
+
+    return Arrangement(
+        seed=seed,
+        blocks=with_fillers,
+        fillers_used=len(with_fillers) - len(base_order),
+        strong_conflicts=strong_cnt,
+        weak_conflicts=weak_cnt,
+        meta={"status": "ideal"},
+    )
+
+
+# ============================================================
 # Стохастический перебор и генерация вариантов
 # ============================================================
 
@@ -405,7 +446,6 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
 
     if not best:
         log.error("❌ Не найдено допустимых перестановок (seed=%s)", seed)
-    #    Возвращаем исходное без краша — как и было
         return Arrangement(seed=seed, blocks=blocks, fillers_used=existing)
 
     with_fillers = _insert_fillers(best, max_weak_allowed, seed)
@@ -430,53 +470,44 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     )
 
 
+# ============================================================
+# Генерация итоговых вариантов
+# ============================================================
+
 @measure_time("optimizer.generate_arrangements")
 async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
-    # 1) Теоретический идеал — СНАЧАЛА проверка перестановкой, ПОТОМ вставка новых тянучек
-    ideal = await theoretical_check(blocks)
-    if ideal.meta.get("status") == "infeasible":
-        return [ideal]
-    log.info("🌟 Отправляю идеальный вариант пользователю, затем ищу альтернативы...")
+    # 1) Теоретический идеал (seed=0) — как раньше
+    ideal0 = await theoretical_check(blocks)
+    if ideal0.meta.get("status") == "infeasible":
+        return [ideal0]
 
-    # Получим N — минимально необходимое число тянучек — из того же расчёта, не меняя логику теоретической проверки
-    feas = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
-    min_needed = int(feas["min_weak_needed"])
+    # 2) Ещё 4 идеальных варианта по той же логике, но с разными seed (влияет только выбор актёров тянучек)
+    ideal_variants: List[Arrangement] = [ideal0]
+    seen_hashes = {arrangement_hash(ideal0.blocks)}
 
-    arrangements: List[Arrangement] = [ideal]
-    seen = {arrangement_hash(ideal.blocks)}
-
-    # ----------------------------------------------------------
-    # 2) 5 вариантов с РОВНО N тянучками
-    # ----------------------------------------------------------
-    log.info("🎯 Генерация 5 вариантов с ровно %d тянучками", min_needed)
-    tries = 0
-    while len(arrangements) < 1 + n_variants and tries < MAX_TRIES:
-        s = random.randint(1000, 99999)
-        arr = await stochastic_branch_and_bound(blocks, s)
-        if arr.fillers_used == min_needed:
-            h = arrangement_hash(arr.blocks)
-            if h not in seen:
-                arrangements.append(arr)
-                seen.add(h)
-        tries += 1
+    ideal_seeds = [random.randint(1000, 99999) for _ in range(4)]
+    for s in ideal_seeds:
+        arr = await _build_ideal_variant(blocks, seed=s)
+        h = arrangement_hash(arr.blocks)
+        if h not in seen_hashes:
+            ideal_variants.append(arr)
+            seen_hashes.add(h)
         await asyncio.sleep(0)
         gc.collect()
 
-    # ----------------------------------------------------------
-    # 3) Ещё 5 вариантов в стандартном режиме
-    # ----------------------------------------------------------
-    log.info("🎲 Генерация дополнительных 5 вариантов в стандартном режиме")
-    tries2 = 0
-    while len(arrangements) < 1 + 2 * n_variants and tries2 < MAX_TRIES:
-        s = random.randint(1000, 99999)
+    # 3) 5 стохастических вариантов (как раньше)
+    stochastic_variants: List[Arrangement] = []
+    stoch_seeds = [random.randint(1000, 99999) for _ in range(n_variants)]
+    for s in stoch_seeds:
         arr = await stochastic_branch_and_bound(blocks, s)
         h = arrangement_hash(arr.blocks)
-        if h not in seen:
-            arrangements.append(arr)
-            seen.add(h)
-        tries2 += 1
+        if h not in seen_hashes:
+            stochastic_variants.append(arr)
+            seen_hashes.add(h)
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info("✅ Сгенерировано вариантов (включая идеальный): %d", len(arrangements))
-    return arrangements
+    result = ideal_variants + stochastic_variants
+    log.info("✅ Сгенерировано вариантов: идеальных=%d, стохастических=%d, итого=%d",
+             len(ideal_variants), len(stochastic_variants), len(result))
+    return result
