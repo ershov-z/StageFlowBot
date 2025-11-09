@@ -93,10 +93,14 @@ async def handle_docx(message: types.Message):
 
     try:
         # === 1️⃣ Сохраняем исходный файл ===
-        file = await bot.get_file(document.file_id)
-        file_path = await bot.download_file(file.file_path)
-        src_path = Path(file_path.name)
-        saved_path = save_uploaded_file(src_path, user_id, document.file_name)
+        tg_file = await bot.get_file(document.file_id)
+        file_bytes = await bot.download_file(tg_file.file_path)
+
+        temp_path = user_dir / document.file_name
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes.read())
+
+        saved_path = save_uploaded_file(temp_path, user_id, document.file_name)
         logger.info(f"📥 Получен файл: {saved_path}")
 
         # === 2️⃣ Парсинг ===
@@ -120,7 +124,11 @@ async def handle_docx(message: types.Message):
             for b in program.blocks
         ]
 
-        write_text(user_id, f"parsed_{time.strftime('%H%M%S')}.json", json.dumps(parsed_payload, ensure_ascii=False, indent=2))
+        write_text(
+            user_id,
+            f"parsed_{time.strftime('%H%M%S')}.json",
+            json.dumps(parsed_payload, ensure_ascii=False, indent=2)
+        )
         await message.answer(responses.PARSING_DONE)
         await message.answer_document(
             FSInputFile(parsed_json_path),
@@ -156,7 +164,11 @@ async def handle_docx(message: types.Message):
         await message.answer(responses.VALIDATION_STARTED)
         valid_arrangements = [a for a in arrangements if validate_arrangement(a.blocks)]
         valid_json = user_dir / f"validated_{time.strftime('%H%M%S')}.json"
-        write_text(user_id, f"validated_{time.strftime('%H%M%S')}.json", json.dumps([a.seed for a in valid_arrangements], ensure_ascii=False, indent=2))
+        write_text(
+            user_id,
+            f"validated_{time.strftime('%H%M%S')}.json",
+            json.dumps([a.seed for a in valid_arrangements], ensure_ascii=False, indent=2)
+        )
         await message.answer(responses.VALIDATION_DONE.format(count=len(valid_arrangements)))
 
         if not valid_arrangements:
@@ -178,9 +190,16 @@ async def handle_docx(message: types.Message):
     except Exception as e:
         logger.exception(f"Ошибка при обработке файла: {e}")
         error_path = user_dir / f"error_{time.strftime('%H%M%S')}.json"
-        write_text(user_id, f"error_{time.strftime('%H%M%S')}.json", json.dumps({"error": str(e)}, ensure_ascii=False, indent=2))
+        write_text(
+            user_id,
+            f"error_{time.strftime('%H%M%S')}.json",
+            json.dumps({"error": str(e)}, ensure_ascii=False, indent=2)
+        )
         await message.answer(responses.ERROR_MESSAGE.format(error=e))
-        await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
+        try:
+            await message.answer_document(FSInputFile(error_path), caption="⚠️ Отладочная информация")
+        except Exception as send_err:
+            logger.warning(f"⚠ Не удалось отправить отладочный файл: {send_err}")
 
     finally:
         try:

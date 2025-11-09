@@ -116,6 +116,22 @@ def cleanup_path(path: Path) -> None:
     except Exception as e:
         logger.warning(f"[FILE_MANAGER] Ошибка очистки {path}: {e}")
 
+# ===========================
+# АСИНХРОННАЯ ЗАГРУЗКА ФАЙЛОВ ИЗ TELEGRAM
+# ===========================
+
+async def save_uploaded_file(bot, document, user_id: int | str) -> Path:
+    """
+    Сохраняет файл, присланный пользователем, прямо из Telegram API.
+    Возвращает путь к сохранённому файлу.
+    """
+    up_dir = uploads_dir_for(user_id)
+    dest = up_dir / document.file_name
+    ensure_dir(dest.parent)
+
+    await bot.download(document, destination=dest)
+    logger.info(f"[FILE_MANAGER] Файл сохранён из Telegram: {dest}")
+    return dest
 
 # ===========================
 # ВСПОМОГАТЕЛЬНОЕ (НЕОБЯЗАТЕЛЬНО)
