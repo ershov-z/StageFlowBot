@@ -1,10 +1,12 @@
 # core/conflicts.py
 from __future__ import annotations
+
 from core.types import Block
 
 # ============================================================
 # 🧩 Вспомогательные
 # ============================================================
+
 
 def _is_perf_pair(a: Block, b: Block) -> bool:
     """Оба блока — номера (performance)."""

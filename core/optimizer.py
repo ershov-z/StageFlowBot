@@ -298,5 +298,13 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info(f"✅ Сгенерировано вариантов: идеальных={len([r for r in results if str(r.meta.get('status', '')).lower() == 'ideal'])}, стохастических={len(results)-1}")
+    ideal_generated = sum(
+        1 for r in results if str(r.meta.get("status", "")).lower() == "ideal"
+    )
+    stochastic_generated = len(results) - ideal_generated
+    log.info(
+        "✅ Сгенерировано вариантов: идеальных=%s, стохастических=%s",
+        ideal_generated,
+        stochastic_generated,
+    )
     return results
