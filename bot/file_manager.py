@@ -1,157 +1,132 @@
-# bot/file_manager.py
 from __future__ import annotations
-import os
-import json
+
+import logging
 import shutil
-import aiofiles
-import zipfile
-from datetime import datetime
 from pathlib import Path
-from aiogram import Bot, types
+from datetime import datetime
 
-from service.logger import get_logger
+from core.exporter import export_all_variants
 
-logger = get_logger(__name__)
-
-# ============================================================
-# 🧭 Вспомогательные функции путей
-# ============================================================
-
-def get_user_dir(base: Path, user_id: int) -> Path:
-    """Возвращает путь каталога пользователя."""
-    d = base / f"user_{user_id}"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+logger = logging.getLogger("bot.file_manager")
 
 
-def get_results_dir(user_dir: Path) -> Path:
-    """Возвращает каталог результатов и создаёт его при необходимости."""
-    d = user_dir / "results"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+# ===========================
+# УТИЛИТЫ ПО ФАЙЛАМ/ДИРЕКТОРИЯМ
+# ===========================
+
+TMP_ROOT = Path("/tmp/stageflow")
 
 
-def timestamp() -> str:
-    """Строка-время для имён файлов."""
+def _ts() -> str:
+    """Строка-временная метка для имён файлов/папок."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# ============================================================
-# 📥 Приём и сохранение исходного файла
-# ============================================================
+def ensure_dir(path: Path) -> Path:
+    """Гарантирует, что директория существует."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-async def save_uploaded_file(bot: Bot, document: types.Document, user_dir: Path) -> Path:
+
+def user_root_dir(user_id: int | str) -> Path:
+    """Корневая временная папка пользователя."""
+    return TMP_ROOT / f"user_{user_id}"
+
+
+def results_dir_for(user_id: int | str) -> Path:
+    """Папка результатов для пользователя."""
+    return ensure_dir(user_root_dir(user_id) / "results")
+
+
+def uploads_dir_for(user_id: int | str) -> Path:
+    """Папка входящих файлов (оригиналы) для пользователя."""
+    return ensure_dir(user_root_dir(user_id) / "uploads")
+
+
+def save_uploaded_file(src: Path, user_id: int | str, dest_name: str | None = None) -> Path:
     """
-    Сохраняет .docx из Telegram в каталог пользователя.
-    Возвращает путь к сохранённому файлу.
+    Сохранить загруженный пользователем файл в его uploads/.
+    Возвращает путь к сохранённой копии.
     """
-    user_dir.mkdir(parents=True, exist_ok=True)
-    filename = document.file_name or f"input_{timestamp()}.docx"
-    dest_path = user_dir / filename
-
-    logger.info(f"📥 Скачиваю файл {filename} …")
-    file_info = await bot.get_file(document.file_id)
-    stream = await bot.download_file(file_info.file_path)
-
-    async with aiofiles.open(dest_path, "wb") as f:
-        await f.write(stream.read())
-
-    logger.info(f"📂 Файл сохранён: {dest_path}")
-    return dest_path
+    up_dir = uploads_dir_for(user_id)
+    dest = up_dir / (dest_name or src.name)
+    ensure_dir(dest.parent)
+    shutil.copy2(src, dest)
+    logger.info(f"[FILE_MANAGER] Файл сохранён: {dest}")
+    return dest
 
 
-# ============================================================
-# 💾 Сохранение промежуточных данных
-# ============================================================
-
-async def save_json(data, path: Path):
-    """Асинхронно сохраняет объект как JSON."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiofiles.open(path, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-    logger.debug(f"💾 JSON сохранён: {path.name}")
+def write_bytes(user_id: int | str, rel_path: str, data: bytes) -> Path:
+    """Записать байты в /tmp/stageflow/user_{id}/{rel_path}."""
+    target = ensure_dir((user_root_dir(user_id) / rel_path).parent) / Path(rel_path).name
+    with open(target, "wb") as f:
+        f.write(data)
+    logger.info(f"[FILE_MANAGER] Записан файл: {target}")
+    return target
 
 
-def save_sync_json(data, path: Path):
-    """Синхронная версия сохранения JSON."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.debug(f"💾 JSON сохранён (sync): {path.name}")
+def write_text(user_id: int | str, rel_path: str, text: str, encoding: str = "utf-8") -> Path:
+    """Записать текст в /tmp/stageflow/user_{id}/{rel_path}."""
+    target = ensure_dir((user_root_dir(user_id) / rel_path).parent) / Path(rel_path).name
+    with open(target, "w", encoding=encoding) as f:
+        f.write(text)
+    logger.info(f"[FILE_MANAGER] Записан текстовый файл: {target}")
+    return target
 
 
-# ============================================================
-# 📦 Экспорт и упаковка результатов
-# ============================================================
+# ===========================
+# ЭКСПОРТ ВАРИАНТОВ
+# ===========================
 
-def copy_export_files(src_dir: Path, dst_dir: Path):
+def export_variants(arrangements, results_dir: Path) -> Path:
     """
-    Копирует все файлы результатов (docx/json) в папку результатов пользователя.
+    Экспортирует все варианты через НОВЫЙ интерфейс export_all_variants(arrangements, results_dir)
+    и возвращает путь к ZIP-архиву с результатами.
+
+    ВНИМАНИЕ: здесь больше НЕТ template_path и дополнительной ручной упаковки ZIP.
+    export_all_variants сам формирует DOCX/JSON и собирает архив.
     """
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for f in src_dir.glob("*"):
-        if f.is_file():
-            shutil.copy2(f, dst_dir / f.name)
-            logger.debug(f"📎 Скопирован: {f.name}")
-
-
-def make_zip(export_dir: Path, archive_path: Path) -> Path:
-    """Создаёт архив ZIP из всех файлов export_dir."""
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for file in export_dir.glob("*"):
-            if file.is_file():
-                zipf.write(file, arcname=file.name)
-                logger.debug(f"📦 Добавлен: {file.name}")
-    logger.info(f"🎁 Архив создан: {archive_path}")
-    return archive_path
-
-
-def export_variants(arrangements, exporter_func, template_path: Path, results_dir: Path) -> Path:
-    """
-    Экспортирует все варианты с помощью exporter_func (export_all) и возвращает путь к ZIP.
-    """
-    zip_path = results_dir / f"StageFlow_Results_{timestamp()}.zip"
-    exporter_func(arrangements, template_path, results_dir)
-    make_zip(results_dir, zip_path)
-    logger.info(f"📦 Экспорт завершён. Архив: {zip_path}")
+    ensure_dir(results_dir)
+    logger.info("[FILE_MANAGER] Экспорт вариантов через export_all_variants()")
+    zip_path = export_all_variants(arrangements, results_dir)
+    logger.info(f"[FILE_MANAGER] 📦 Экспорт завершён. Архив готов: {zip_path}")
     return zip_path
 
 
-# ============================================================
-# 🧹 Очистка временных директорий
-# ============================================================
+# ===========================
+# ОЧИСТКА
+# ===========================
 
-async def cleanup_temp(user_dir: Path, keep_results: bool = True):
+def cleanup_user_workspace(user_id: int | str) -> None:
+    """Полная очистка рабочей папки пользователя (/tmp/stageflow/user_{id})."""
+    root = user_root_dir(user_id)
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+        logger.info(f"🧹 Очистка завершена: {root}")
+
+
+def cleanup_path(path: Path) -> None:
+    """Удалить произвольный путь (директорию/файл)."""
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink(missing_ok=True)
+        logger.info(f"🧹 Очистка завершена: {path}")
+    except Exception as e:
+        logger.warning(f"[FILE_MANAGER] Ошибка очистки {path}: {e}")
+
+
+# ===========================
+# ВСПОМОГАТЕЛЬНОЕ (НЕОБЯЗАТЕЛЬНО)
+# ===========================
+
+def prepare_results_dir(user_id: int | str) -> Path:
     """
-    Удаляет все временные файлы пользователя.
-    Если keep_results=True, папка results/ сохраняется.
+    Создаёт свежую results/ с временной меткой внутри user_{id}.
+    Можно использовать, если нужно разносить выгрузки по подпапкам.
     """
-    if not user_dir.exists():
-        return
-
-    for item in user_dir.iterdir():
-        try:
-            if keep_results and item.is_dir() and item.name == "results":
-                continue
-            if item.is_file():
-                item.unlink(missing_ok=True)
-            else:
-                shutil.rmtree(item, ignore_errors=True)
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка очистки {item}: {e}")
-
-    logger.info(f"🧹 Очистка завершена: {user_dir}")
-
-
-# ============================================================
-# 🧪 Локальный тест (CLI)
-# ============================================================
-
-if __name__ == "__main__":
-    base = Path("/tmp/stageflow_test")
-    user = get_user_dir(base, 123)
-    res = get_results_dir(user)
-    print("Создан:", res)
-    make_zip(res, res / "dummy.zip")
-    print("ZIP готов.")
+    base = results_dir_for(user_id)
+    target = ensure_dir(base)  # оставляем плоскую структуру, как в логах проекта
+    logger.info(f"[FILE_MANAGER] Директория результатов: {target}")
+    return target
