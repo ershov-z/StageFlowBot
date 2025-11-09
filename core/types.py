@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
@@ -52,6 +53,7 @@ class Block:
     pp_raw: str = ""             # исходная строка «ПП»
     hire: str = ""               # колонка «Найм»
     responsible: str = ""        # колонка «Ответственный»
+    kv_raw: str = ""             # исходная строка «Кв»
 
     def __hash__(self):
         return hash(self.id)
@@ -67,6 +69,30 @@ class Block:
     def has_actor(self, name: str) -> bool:
         """Проверяет, есть ли актёр с указанным именем."""
         return any(a.name.lower() == name.lower() for a in self.actors)
+
+    def to_dict(self) -> dict:
+        """Сериализует блок в словарь для экспорта."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "actors": [
+                {
+                    "name": actor.name,
+                    "tags": list(actor.tags),
+                }
+                for actor in self.actors
+            ],
+            "kv": self.kv,
+            "fixed": self.fixed,
+            "meta": self.meta or {},
+            "num": self.num,
+            "actors_raw": self.actors_raw,
+            "pp_raw": self.pp_raw,
+            "hire": self.hire,
+            "responsible": self.responsible,
+            "kv_raw": self.kv_raw,
+        }
 
 
 # ============================================================
