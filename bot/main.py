@@ -88,7 +88,7 @@ async def handle_docx(message: types.Message):
     await message.answer(responses.FILE_RECEIVED.format(name=document.file_name))
     await message.answer(responses.PARSING_STARTED)
 
-    user_dir = uploads_dir_for(user_id)
+    uploads_dir_for(user_id)  # гарантируем наличие uploads/
     results_dir = results_dir_for(user_id)
 
     try:
@@ -98,8 +98,7 @@ async def handle_docx(message: types.Message):
 
         # === 2️⃣ Парсинг ===
         program = parse_docx(str(saved_path))
-        parsed_json_path = user_dir / f"parsed_{time.strftime('%H%M%S')}.json"
-
+        parsed_filename = f"parsed_{time.strftime('%H%M%S')}.json"
         parsed_payload = [
             {
                 "id": b.id,
@@ -112,15 +111,16 @@ async def handle_docx(message: types.Message):
                 "pp_raw": b.pp_raw,
                 "hire": b.hire,
                 "responsible": b.responsible,
+                "kv_raw": b.kv_raw,
                 "actors": [{"name": a.name, "tags": list(a.tags)} for a in b.actors],
             }
             for b in program.blocks
         ]
 
-        write_text(
+        parsed_json_path = write_text(
             user_id,
-            f"parsed_{time.strftime('%H%M%S')}.json",
-            json.dumps(parsed_payload, ensure_ascii=False, indent=2)
+            f"uploads/{parsed_filename}",
+            json.dumps(parsed_payload, ensure_ascii=False, indent=2),
         )
         await message.answer(responses.PARSING_DONE)
         await message.answer_document(
@@ -156,11 +156,11 @@ async def handle_docx(message: types.Message):
         # === 4️⃣ Валидация ===
         await message.answer(responses.VALIDATION_STARTED)
         valid_arrangements = [a for a in arrangements if validate_arrangement(a.blocks)]
-        valid_json = user_dir / f"validated_{time.strftime('%H%M%S')}.json"
+        validated_filename = f"validated_{time.strftime('%H%M%S')}.json"
         write_text(
             user_id,
-            f"validated_{time.strftime('%H%M%S')}.json",
-            json.dumps([a.seed for a in valid_arrangements], ensure_ascii=False, indent=2)
+            f"uploads/{validated_filename}",
+            json.dumps([a.seed for a in valid_arrangements], ensure_ascii=False, indent=2),
         )
         await message.answer(responses.VALIDATION_DONE.format(count=len(valid_arrangements)))
 
@@ -170,7 +170,7 @@ async def handle_docx(message: types.Message):
 
         # === 5️⃣ Экспорт ===
         await message.answer(responses.EXPORT_STARTED)
-        zip_path = export_all(valid_arrangements, results_dir)
+        zip_path = export_all(valid_arrangements, results_dir, template_path=saved_path)
 
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
@@ -182,11 +182,11 @@ async def handle_docx(message: types.Message):
 
     except Exception as e:
         logger.exception(f"Ошибка при обработке файла: {e}")
-        error_path = user_dir / f"error_{time.strftime('%H%M%S')}.json"
-        write_text(
+        error_filename = f"error_{time.strftime('%H%M%S')}.json"
+        error_path = write_text(
             user_id,
-            f"error_{time.strftime('%H%M%S')}.json",
-            json.dumps({"error": str(e)}, ensure_ascii=False, indent=2)
+            f"uploads/{error_filename}",
+            json.dumps({"error": str(e)}, ensure_ascii=False, indent=2),
         )
         await message.answer(responses.ERROR_MESSAGE.format(error=e))
         try:

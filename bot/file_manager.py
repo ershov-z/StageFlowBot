@@ -1,13 +1,13 @@
 from __future__ import annotations
-
 import logging
 import shutil
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 from core.exporter import export_all_variants
 
-logger = logging.getLogger("bot.file_manager")
+
+logger = logging.getLogger("stageflow.file_manager")
 
 
 # ===========================
@@ -43,7 +43,7 @@ def uploads_dir_for(user_id: int | str) -> Path:
     return ensure_dir(user_root_dir(user_id) / "uploads")
 
 
-def save_uploaded_file(src: Path, user_id: int | str, dest_name: str | None = None) -> Path:
+def save_local_file(src: Path, user_id: int | str, dest_name: str | None = None) -> Path:
     """
     Сохранить загруженный пользователем файл в его uploads/.
     Возвращает путь к сохранённой копии.
@@ -54,6 +54,10 @@ def save_uploaded_file(src: Path, user_id: int | str, dest_name: str | None = No
     shutil.copy2(src, dest)
     logger.info(f"[FILE_MANAGER] Файл сохранён: {dest}")
     return dest
+
+
+# Совместимость со старым названием (синхронный вариант)
+save_uploaded_file_sync = save_local_file
 
 
 def write_bytes(user_id: int | str, rel_path: str, data: bytes) -> Path:
@@ -78,17 +82,15 @@ def write_text(user_id: int | str, rel_path: str, text: str, encoding: str = "ut
 # ЭКСПОРТ ВАРИАНТОВ
 # ===========================
 
-def export_variants(arrangements, results_dir: Path) -> Path:
+def export_variants(arrangements, results_dir: Path, template_path: Path | str | None = None) -> Path:
     """
-    Экспортирует все варианты через НОВЫЙ интерфейс export_all_variants(arrangements, results_dir)
-    и возвращает путь к ZIP-архиву с результатами.
-
-    ВНИМАНИЕ: здесь больше НЕТ template_path и дополнительной ручной упаковки ZIP.
-    export_all_variants сам формирует DOCX/JSON и собирает архив.
+    Экспортирует все варианты через интерфейс export_all_variants(arrangements, results_dir)
+    и возвращает путь к ZIP-архиву с результатами. При наличии template_path исходный
+    документ используется как шаблон для DOCX.
     """
     ensure_dir(results_dir)
     logger.info("[FILE_MANAGER] Экспорт вариантов через export_all_variants()")
-    zip_path = export_all_variants(arrangements, results_dir)
+    zip_path = export_all_variants(arrangements, results_dir, template_path=template_path)
     logger.info(f"[FILE_MANAGER] 📦 Экспорт завершён. Архив готов: {zip_path}")
     return zip_path
 
