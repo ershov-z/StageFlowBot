@@ -312,13 +312,33 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
 
 @measure_time("optimizer.generate_arrangements")
 async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
-    ideal = await theoretical_check(blocks)
-    if ideal.meta.get("status") == "infeasible":
-        return [ideal]
+    ideal0 = await theoretical_check(blocks)
+    if ideal0.meta.get("status") == "infeasible":
+        return [ideal0]
 
-    results = [ideal]
-    seen = {arrangement_hash(ideal.blocks)}
+    results = [ideal0]
+    seen = {arrangement_hash(ideal0.blocks)}
 
+    # 🟢 Генерируем дополнительные идеальные варианты
+    for _ in range(4):
+        s = random.randint(1000, 99999)
+        feasible, minw, order = _build_ideal_order(blocks, s)
+        if feasible:
+            with_fillers = _insert_fillers(order, MAX_FILLERS_TOTAL, seed=s)
+            arr = Arrangement(
+                seed=s,
+                blocks=with_fillers,
+                fillers_used=len(with_fillers) - len(order),
+                strong_conflicts=0,
+                weak_conflicts=0,
+                meta={"status": "ideal"},
+            )
+            h = arrangement_hash(arr.blocks)
+            if h not in seen:
+                results.append(arr)
+                seen.add(h)
+
+    # 🎲 Стохастические варианты
     for _ in range(n_variants):
         s = random.randint(1000, 99999)
         arr = await stochastic_branch_and_bound(blocks, s)
@@ -329,5 +349,5 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info(f"✅ Сгенерировано вариантов (включая идеальный): {len(results)}")
+    log.info(f"✅ Сгенерировано вариантов: идеальных={len([r for r in results if r.meta.get('status')=='ideal'])}, стохастических={len(results)-1}")
     return results
