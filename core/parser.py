@@ -261,6 +261,7 @@ def parse_docx(path: str) -> Program:
             pp_raw=pp_raw or "",
             hire=hire or "",
             responsible=resp or "",
+            kv_raw=kv_raw or "",
         ))
         next_id += 1
 

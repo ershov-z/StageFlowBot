@@ -39,6 +39,7 @@ def _copy_block(block: Block) -> Block:
         pp_raw=block.pp_raw,
         hire=block.hire,
         responsible=block.responsible,
+        kv_raw=block.kv_raw,
     )
 
 
@@ -56,6 +57,7 @@ def _make_filler(prev: Block, nxt: Block, actor_name: str, next_id: int) -> Bloc
         pp_raw="",
         hire="",
         responsible="",
+        kv_raw="",
         meta={"auto": True, "between": (prev.name, nxt.name)},
     )
 

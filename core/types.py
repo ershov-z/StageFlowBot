@@ -53,6 +53,7 @@ class Block:
     pp_raw: str = ""             # исходная строка «ПП»
     hire: str = ""               # колонка «Найм»
     responsible: str = ""        # колонка «Ответственный»
+    kv_raw: str = ""             # исходная строка «Кв»
 
     def __hash__(self):
         return hash(self.id)
@@ -90,6 +91,7 @@ class Block:
             "pp_raw": self.pp_raw,
             "hire": self.hire,
             "responsible": self.responsible,
+            "kv_raw": self.kv_raw,
         }
 
 

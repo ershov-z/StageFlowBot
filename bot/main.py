@@ -111,6 +111,7 @@ async def handle_docx(message: types.Message):
                 "pp_raw": b.pp_raw,
                 "hire": b.hire,
                 "responsible": b.responsible,
+                "kv_raw": b.kv_raw,
                 "actors": [{"name": a.name, "tags": list(a.tags)} for a in b.actors],
             }
             for b in program.blocks
@@ -169,7 +170,7 @@ async def handle_docx(message: types.Message):
 
         # === 5️⃣ Экспорт ===
         await message.answer(responses.EXPORT_STARTED)
-        zip_path = export_all(valid_arrangements, results_dir)
+        zip_path = export_all(valid_arrangements, results_dir, template_path=saved_path)
 
         await message.answer(responses.EXPORT_DONE)
         await message.answer(responses.ARCHIVE_DONE)
