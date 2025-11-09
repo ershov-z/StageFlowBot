@@ -1,205 +1,107 @@
-# core/exporter.py
 from __future__ import annotations
-from docx import Document
-from pathlib import Path
-import zipfile
 import json
-from typing import Dict, Optional, List
+import logging
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+from core.types import Arrangement, Block
+from core.docx_builder import create_docx
 
-from core.types import Block, Arrangement
-from service.logger import get_logger
+log = logging.getLogger("stageflow.exporter")
 
-logger = get_logger(__name__)
+# ============================================================
+# JSON-экспорт вспомогательная функция
+# ============================================================
+
+def export_json(arr: Arrangement, path: Path, extra: dict | None = None):
+    """Сохраняет JSON-файл с программой."""
+    data = {
+        "seed": arr.seed,
+        "strong_conflicts": arr.strong_conflicts,
+        "weak_conflicts": arr.weak_conflicts,
+        "fillers_used": arr.fillers_used,
+        "meta": arr.meta or {},
+        "blocks": [b.to_dict() for b in arr.blocks],
+    }
+    if extra:
+        data.update(extra)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log.info(f"[EXPORT] JSON сохранён: {path.name}")
 
 
 # ============================================================
-# 🗂️ Определение схемы колонок таблицы шаблона
+# DOCX-экспорт одного варианта
 # ============================================================
 
-def _normalize_header(s: str) -> str:
-    return (s or "").strip().lower()
+def export_variant(arr: Arrangement, index: int, output_dir: Path) -> tuple[str, str]:
+    """Экспортирует один вариант в DOCX и JSON."""
+    seed = arr.seed
+    is_ideal = arr.meta.get("status") == "ideal"
+    label = f"StageFlow_Variant_{index}_seed{seed}"
+    if is_ideal:
+        label += "_IDEAL"
 
+    docx_path = output_dir / f"{label}.docx"
+    json_path = output_dir / f"{label}.json"
 
-def _guess_mapping_by_header(header_cells: List[str]) -> Optional[Dict[str, int]]:
-    h = [_normalize_header(x) for x in header_cells]
-    idx = {name: i for i, name in enumerate(h)}
+    # Генерация документа
+    create_docx(
+        arr.blocks,
+        docx_path,
+        title=f"Вариант #{index} (seed={seed}){' — ИДЕАЛЬНЫЙ' if is_ideal else ''}"
+    )
 
-    def find(*aliases) -> Optional[int]:
-        for a in aliases:
-            if a in idx:
-                return idx[a]
-        return None
+    # Экспорт JSON
+    export_json(arr, json_path, extra={"is_ideal": is_ideal})
 
-    num_i  = find("№", "номер", "num", "#", "n")
-    name_i = find("название", "title", "назв")
-    act_i  = find("актеры", "актёры", "actors", "участники")
-    pp_i   = find("пп", "pp")
-    hire_i = find("найм", "наим", "hire")
-    rsp_i  = find("ответственный", "ответств", "responsible")
-    kv_i   = find("кв", "kv")
-
-    if all(x is not None for x in (num_i, name_i, act_i, pp_i, hire_i, rsp_i, kv_i)):
-        return {"num": num_i, "name": name_i, "actors": act_i, "pp": pp_i, "hire": hire_i, "resp": rsp_i, "kv": kv_i}
-
-    if all(x is not None for x in (num_i, act_i, pp_i, kv_i)):
-        return {
-            "num": num_i,
-            "name": None,
-            "actors": act_i,
-            "pp": pp_i,
-            "hire": hire_i if hire_i is not None else (3 if len(h) > 3 else None),
-            "resp": rsp_i if rsp_i is not None else (4 if len(h) > 4 else None),
-            "kv": kv_i
-        }
-
-    return None
-
-
-def _fallback_mapping_by_count(n_cols: int) -> Dict[str, Optional[int]]:
-    if n_cols >= 7:
-        return {"num": 0, "name": 1, "actors": 2, "pp": 3, "hire": 4, "resp": 5, "kv": 6}
-    return {"num": 0, "name": None, "actors": 1, "pp": 2, "hire": 3 if n_cols > 3 else None,
-            "resp": 4 if n_cols > 4 else None, "kv": 5 if n_cols > 5 else None}
+    log.info(f"[EXPORT] {'Идеальный ' if is_ideal else ''}вариант seed={seed} → {docx_path.name}")
+    return str(docx_path), str(json_path)
 
 
 # ============================================================
-# 🎨 Оформление строк
+# Пакетный экспорт всех вариантов
 # ============================================================
 
-def _set_row_shading(row, color_hex: str):
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls
-    for cell in row.cells:
-        cell._element.get_or_add_tcPr().append(
-            parse_xml(rf'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
-        )
+def export_all_variants(arrangements: list[Arrangement], output_dir: Path) -> Path:
+    """
+    Экспортирует все варианты в DOCX и JSON и собирает ZIP.
+    Идеальные варианты помещаются в начало архива.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log.info("[EXPORT_ALL] Начинается пакетный экспорт всех вариантов")
 
+    # Сначала сортируем, чтобы идеальные шли первыми
+    sorted_arrs = sorted(
+        arrangements,
+        key=lambda a: 0 if a.meta.get("status") == "ideal" else 1
+    )
 
-# ============================================================
-# 📦 Экспорт одного варианта
-# ============================================================
+    exported_files: list[str] = []
+    for idx, arr in enumerate(sorted_arrs, start=1):
+        docx_path, json_path = export_variant(arr, idx, output_dir)
+        exported_files.extend([docx_path, json_path])
 
-def export_arrangement(arrangement: Arrangement, template_path: Path, output_path: Path) -> Path:
-    logger.info(f"[EXPORT] Начат экспорт seed={arrangement.seed}")
+    # Архивируем всё
+    zip_path = output_dir / "StageFlow_Results.zip"
+    with ZipFile(zip_path, "w", ZIP_DEFLATED) as zipf:
+        for fpath in exported_files:
+            arcname = Path(fpath).name
+            zipf.write(fpath, arcname)
+            log.info(f"[EXPORT_ALL] Добавлен в архив: {arcname}")
 
-    doc = Document(template_path)
-    if not doc.tables:
-        raise RuntimeError("В шаблоне отсутствуют таблицы для экспорта")
-
-    table = doc.tables[0]
-
-    header_cells = [c.text for c in table.rows[0].cells] if table.rows else []
-    mapping = _guess_mapping_by_header(header_cells)
-    if mapping is None:
-        mapping = _fallback_mapping_by_count(len(table.rows[0].cells))
-
-    while len(table.rows) > 1:
-        table._element.remove(table.rows[1]._element)
-
-    seq = 0
-    for block in arrangement.blocks:
-        row = table.add_row()
-        cells = row.cells
-
-        def set_cell(key: str, text: str):
-            idx = mapping.get(key)
-            if idx is not None and idx < len(cells):
-                cells[idx].text = text
-
-        # Нумерация только для выступлений
-        if block.type == "performance":
-            seq += 1
-            set_cell("num", str(seq))
-        else:
-            set_cell("num", "")
-
-        # Название
-        display_name = block.name or ""
-        if block.type == "prelude":
-            display_name = "Предкулисье"
-        elif block.type == "filler":
-            display_name = "Тянучка"
-        elif block.type == "sponsor":
-            display_name = "Спонсоры"
-        if mapping.get("name") is not None:
-            set_cell("name", display_name)
-
-        # Оформление цветов
-        if block.type == "filler":
-            _set_row_shading(row, "FFF2CC")
-        elif block.type == "prelude":
-            _set_row_shading(row, "D9E1F2")
-        elif block.type == "sponsor":
-            _set_row_shading(row, "E2EFDA")
-
-        # Колонки "Актёры" и "ПП"
-        if block.type == "filler":
-            actor_name = (block.actors[0].name if block.actors else "").strip()
-            if actor_name.lower() == "пушкин":
-                set_cell("pp", "Пушкин")
-                set_cell("actors", "")
-            else:
-                set_cell("actors", actor_name)
-                set_cell("pp", "")
-        else:
-            set_cell("actors", getattr(block, "actors_raw", "") or "")
-            set_cell("pp", getattr(block, "pp_raw", "") or "")
-
-        # Найм / Ответственный
-        set_cell("hire", getattr(block, "hire", "") or "")
-        set_cell("resp", getattr(block, "responsible", "") or "")
-
-        # kv — метка
-        set_cell("kv", "кв" if getattr(block, "kv", False) else "")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(output_path)
-    logger.info(f"[EXPORT] Успешно сохранён DOCX: {output_path}")
-    return output_path
-
-
-# ============================================================
-# 📦 Экспорт всех 5 вариантов + JSON
-# ============================================================
-
-def export_all(arrangements: list[Arrangement], template_path: Path, export_dir: Path) -> Path:
-    logger.info("[EXPORT_ALL] Начинается пакетный экспорт всех вариантов")
-
-    export_dir.mkdir(parents=True, exist_ok=True)
-    exported_files = []
-
-    for i, arrangement in enumerate(arrangements, start=1):
-        output_docx = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.docx"
-        output_json = export_dir / f"StageFlow_Variant_{i}_seed{arrangement.seed}.json"
-
-        export_arrangement(arrangement, template_path, output_docx)
-
-        json_data = [
-            {
-                "id": b.id,
-                "name": b.name,
-                "type": b.type,
-                "kv": b.kv,
-                "fixed": b.fixed,
-                "num": getattr(b, "num", ""),
-                "actors_raw": getattr(b, "actors_raw", ""),
-                "pp_raw": getattr(b, "pp_raw", ""),
-                "hire": getattr(b, "hire", ""),
-                "responsible": getattr(b, "responsible", ""),
-                "actors": [{"name": a.name, "tags": list(a.tags)} for a in b.actors],
-            }
-            for b in arrangement.blocks
-        ]
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-
-        exported_files.extend([output_docx, output_json])
-
-    zip_path = export_dir / "StageFlow_Results.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for path in exported_files:
-            zipf.write(path, arcname=path.name)
-            logger.info(f"[EXPORT_ALL] Добавлен в архив: {path.name}")
-
-    logger.info(f"[EXPORT_ALL] Архив готов: {zip_path}")
+    log.info(f"[EXPORT_ALL] Архив готов: {zip_path}")
     return zip_path
+
+
+# ============================================================
+# Для ручного теста
+# ============================================================
+
+if __name__ == "__main__":
+    from core.types import Actor
+
+    # Простая проверка экспорта
+    test_block = Block(1, "Номер 1", "performance", [Actor("Пушкин")])
+    arr = Arrangement(seed=0, blocks=[test_block], fillers_used=0, strong_conflicts=0, weak_conflicts=0, meta={"status": "ideal"})
+    out_dir = Path("./test_export")
+    export_all_variants([arr], out_dir)
