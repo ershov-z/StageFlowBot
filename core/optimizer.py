@@ -136,10 +136,12 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
     if n == 0:
         return True, 0, []
 
+    # Быстрая необходимая проверка по kv (kv подряд недопустимы)
     kv_cnt = sum(1 for b in movable if b.kv)
     if kv_cnt > n - kv_cnt + 1:
         return False, 999, []
 
+    # --- Точный перебор для малых сегментов ---
     if n <= 8:
         best_cost, best_order = inf, None
         for perm in permutations(movable, n):
@@ -152,6 +154,7 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
             return False, 999, []
         return True, int(best_cost), best_order
 
+    # --- DP для больших сегментов ---
     w = [[inf] * n for _ in range(n)]
     cost_L = [inf] * n
     cost_R = [inf] * n
@@ -169,7 +172,7 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
     for j in range(n):
         if cost_L[j] < inf:
             DP[1 << j][j] = cost_L[j]
-            PREV[1 << j][j] = -2
+            PREV[1 << j][j] = -2  # старт
 
     for mask in range(size):
         for j in range(n):
@@ -200,6 +203,7 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
     if best_cost == inf:
         return False, 999, []
 
+    # восстановление
     order_idx: List[int] = []
     mask, j = full, best_end
     while j not in (-1, -2):
@@ -215,12 +219,19 @@ def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, i
 
 
 def _build_ideal_order(blocks: List[Block]) -> Tuple[bool, int, List[Block]]:
+    """
+    Режем на сегменты по якорям (fixed / prelude / sponsor / существующие filler).
+    Внутри каждого сегмента переставляем только performance, минимизируя слабые, запрещая сильные.
+    Возвращает (есть_ли_вообще_порядок_без_сильных, минимум_слабых_по_всей_программе, порядок_без_новых_тянучек).
+    """
     base = [_copy_block(b) for b in blocks]
 
+    # Якоря: prelude, sponsor, уже существующие filler — фиксируем всегда
     for b in base:
         if b.type in {"prelude", "sponsor"} or b.type == "filler":
             b.fixed = True
 
+    # Первые 2 и последние 4 performance — фиксируем, но без перекрытия на коротких программах
     perf_idx = [i for i, b in enumerate(base) if b.type == "performance"]
     if len(perf_idx) >= 6:
         for i in perf_idx[:2] + perf_idx[-4:]:
@@ -255,15 +266,23 @@ def _build_ideal_order(blocks: List[Block]) -> Tuple[bool, int, List[Block]]:
 
 
 def theoretical_feasibility_exact(blocks: List[Block], max_fillers_total: int) -> dict:
-    existing_user_fillers = sum(1 for b in blocks if b.type == "filler")
-    allowed_new = max(0, max_fillers_total - existing_user_fillers)
+    """
+    ГЛАВНОЕ: оцениваем возможность по оставшимся тянучкам.
+    Сначала ищем минимум слабых конфликтов перестановкой, затем сравниваем:
+      min_weak_needed <= (max_fillers_total - existing_user_fillers)
+    """
+    existing_user_fillers = sum(1 for b in blocks if b.type == "filler")  # уже заняты пользователем
+    allowed_new = max(0, max_fillers_total - existing_user_fillers)       # сколько можно добавить
     feasible_no_strong, min_weak_needed, ideal_order = _build_ideal_order(blocks)
+
     can_fit = feasible_no_strong and (min_weak_needed <= allowed_new)
+
+    # Для логов отдаём и "остаток", и "общий лимит" на всякий случай
     return {
         "feasible": can_fit,
         "min_weak_needed": int(min_weak_needed if feasible_no_strong else 999),
-        "available_fillers": int(allowed_new),
-        "limit_total": int(max_fillers_total),
+        "available_fillers": int(allowed_new),   # СКОЛЬКО МОЖНО ДОБАВИТЬ
+        "limit_total": int(max_fillers_total),   # ОБЩИЙ лимит
         "existing_fillers": int(existing_user_fillers),
         "strong_possible": feasible_no_strong,
         "order": ideal_order if feasible_no_strong else blocks,
@@ -273,10 +292,11 @@ def theoretical_feasibility_exact(blocks: List[Block], max_fillers_total: int) -
 @measure_time("optimizer.theoretical_check")
 async def theoretical_check(blocks: List[Block]) -> Arrangement:
     feas = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
+
     if not feas["feasible"]:
         log.error(
-            "❌ Теоретически неразрешимо: нужно %s тянучек, а доступно только %s",
-            feas["min_weak_needed"], feas["available_fillers"]
+            "❌ Теоретически неразрешимо: нужно %s тянучек, а доступно только %s (из общего лимита %s, занято уже %s).",
+            feas["min_weak_needed"], feas["available_fillers"], feas["limit_total"], feas["existing_fillers"]
         )
         return Arrangement(
             seed=0,
@@ -286,12 +306,21 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
             weak_conflicts=0,
             meta={
                 "status": "infeasible",
-                "message": f"Эту программу невозможно разрешить: нужно минимум {feas['min_weak_needed']} тянучек, доступно {feas['available_fillers']}.",
-                **feas
+                "message": (
+                    f"Эту программу невозможно разрешить: "
+                    f"нужно минимум {feas['min_weak_needed']} тянучек, "
+                    f"доступно новых {feas['available_fillers']} (общий лимит {feas['limit_total']}, "
+                    f"уже занято {feas['existing_fillers']})."
+                ),
+                "min_weak_needed": feas["min_weak_needed"],
+                "available_fillers": feas["available_fillers"],
+                "existing_fillers": feas["existing_fillers"],
+                "limit_total": feas["limit_total"],
             },
         )
 
-    base_order = feas["order"]
+    # Есть теоретический идеал: берём найденный порядок, затем вставляем РОВНО новые тянучки (не трогаем уже существующие)
+    base_order: List[Block] = feas["order"]
     allowed_new = feas["available_fillers"]
     with_fillers = _insert_fillers(base_order, allowed_new, seed=0)
 
@@ -305,10 +334,16 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
         for i in range(len(with_fillers) - 1)
         if with_fillers[i].type == with_fillers[i + 1].type == "performance"
     )
+
+    log.info(
+        "🌟 Математический идеал: слабых=%d → вставляем новых тянучек=%d (из доступных %d). "
+        "Сильных после вставки=%d, слабых остаточных=%d.",
+        feas["min_weak_needed"], len(with_fillers) - len(base_order), allowed_new, strong_cnt, weak_cnt
+    )
     return Arrangement(
         seed=0,
         blocks=with_fillers,
-        fillers_used=len(with_fillers) - len(base_order),
+        fillers_used=len(with_fillers) - len(base_order),  # только новые
         strong_conflicts=strong_cnt,
         weak_conflicts=weak_cnt,
         meta={"status": "ideal", **feas},
@@ -324,6 +359,8 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     rng = random.Random(seed)
     existing = sum(1 for b in blocks if b.type == "filler")
     max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing)
+    log.info("🧮 Стохастика (seed=%s) | уже есть тянучек=%d, можно добавить=%d", seed, existing, max_weak_allowed)
+
     base = [_copy_block(b) for b in blocks]
     for b in base:
         if b.type in {"prelude", "sponsor"} or b.type == "filler":
@@ -336,21 +373,34 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         for i in perf_idx[:2]:
             base[i].fixed = True
     movable = [b for b in base if b.type == "performance" and not b.fixed]
-    best = None
-    for _ in range(MAX_TRIES):
+    if not movable:
+        log.warning("⚠️ Все блоки фиксированы (seed=%s)", seed)
+        return Arrangement(seed=seed, blocks=blocks, fillers_used=existing)
+
+    best, best_weak = None, 999
+    for attempt in range(1, MAX_TRIES + 1):
         shuf = movable[:]
         rng.shuffle(shuf)
-        new_order, m_idx = [], 0
+        new_order: List[Block] = []
+        m_idx = 0
         for b in base:
-            new_order.append(b if b.fixed else shuf[m_idx]); m_idx += (not b.fixed)
+            if b.fixed:
+                new_order.append(b)
+            else:
+                new_order.append(shuf[m_idx])
+                m_idx += 1
         if _has_strong_conflicts(new_order):
             continue
         w = _count_weak_conflicts(new_order)
         if w <= max_weak_allowed:
-            best = new_order
-            break
+            best, best_weak = new_order, w
+            if w == 0:
+                break
+
     if not best:
+        log.error("❌ Не найдено допустимых перестановок (seed=%s)", seed)
         return Arrangement(seed=seed, blocks=blocks, fillers_used=existing)
+
     with_fillers = _insert_fillers(best, max_weak_allowed, seed)
     strong_cnt = sum(
         (strong_conflict(with_fillers[i], with_fillers[i + 1]) or kv_conflict(with_fillers[i], with_fillers[i + 1]))
@@ -362,10 +412,12 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
         for i in range(len(with_fillers) - 1)
         if with_fillers[i].type == with_fillers[i + 1].type == "performance"
     )
+
+    log.info("✅ Найден вариант (seed=%s): слабых=%d → новых тянучек=%d", seed, weak_cnt, len(with_fillers) - len(best))
     return Arrangement(
         seed=seed,
         blocks=with_fillers,
-        fillers_used=len(with_fillers) - len(best),
+        fillers_used=len(with_fillers) - len(best),  # только новые
         strong_conflicts=strong_cnt,
         weak_conflicts=weak_cnt,
     )
@@ -373,15 +425,21 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
 
 @measure_time("optimizer.generate_arrangements")
 async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
+    # 1) Теоретический идеал — СНАЧАЛА проверка перестановкой, ПОТОМ вставка новых тянучек
     ideal = await theoretical_check(blocks)
     if ideal.meta.get("status") == "infeasible":
         return [ideal]
 
+    # Берём минимально нужное число тянучек N из мета-данных идеала
     min_needed = ideal.meta.get("min_weak_needed", 0)
-    arrangements = [ideal]
+    log.info("🌟 Теоретически требуется %d тянучек — генерируем 5 вариантов с ровно N и 5 по старой схеме", min_needed)
+
+    arrangements: List[Arrangement] = [ideal]
     seen = {arrangement_hash(ideal.blocks)}
 
-    # 5 с ровно N тянучками
+    # ----------------------------------------------------------
+    # 2) Пакет №1: 5 вариантов с РОВНО N тянучками
+    # ----------------------------------------------------------
     seeds_fixed = [random.randint(1000, 99999) for _ in range(n_variants)]
     for s in seeds_fixed:
         arr = await stochastic_branch_and_bound(blocks, s)
@@ -390,10 +448,14 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
             if h not in seen:
                 arrangements.append(arr)
                 seen.add(h)
-        if len(arrangements) >= 1 + n_variants:
+        await asyncio.sleep(0)
+        gc.collect()
+        if len(arrangements) >= 1 + n_variants:  # идеал + 5 фиксированных
             break
 
-    # 5 обычных
+    # ----------------------------------------------------------
+    # 3) Пакет №2: ещё 5 вариантов в стандартном режиме
+    # ----------------------------------------------------------
     seeds_extra = [random.randint(1000, 99999) for _ in range(n_variants)]
     for s in seeds_extra:
         arr = await stochastic_branch_and_bound(blocks, s)
@@ -401,7 +463,10 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         if h not in seen:
             arrangements.append(arr)
             seen.add(h)
+        await asyncio.sleep(0)
+        gc.collect()
         if len(arrangements) >= 1 + 2 * n_variants:
             break
 
+    log.info("✅ Сгенерировано вариантов (включая идеальный): %d", len(arrangements))
     return arrangements
