@@ -93,14 +93,7 @@ async def handle_docx(message: types.Message):
 
     try:
         # === 1️⃣ Сохраняем исходный файл ===
-        tg_file = await bot.get_file(document.file_id)
-        file_bytes = await bot.download_file(tg_file.file_path)
-
-        temp_path = user_dir / document.file_name
-        with open(temp_path, "wb") as f:
-            f.write(file_bytes.read())
-
-        saved_path = save_uploaded_file(temp_path, user_id, document.file_name)
+        saved_path = await save_uploaded_file(bot, document, user_id)
         logger.info(f"📥 Получен файл: {saved_path}")
 
         # === 2️⃣ Парсинг ===
