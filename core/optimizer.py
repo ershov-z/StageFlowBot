@@ -115,6 +115,7 @@ def _edge_cost(a: Block, b: Block) -> int:
 
 
 def _segment_cost_with_bounds(order: List[Block], L: Block, R: Block) -> int:
+    """Стоимость L -> order -> R: число слабых конфликтов; inf если где-то сильный."""
     if not order:
         return _edge_cost(L, R)
     total = _edge_cost(L, order[0])
@@ -132,6 +133,10 @@ def _segment_cost_with_bounds(order: List[Block], L: Block, R: Block) -> int:
 
 
 def _segment_min_path(movable: List[Block], L: Block, R: Block) -> Tuple[bool, int, List[Block]]:
+    """
+    Возвращает (feasible, min_cost, ordered_blocks).
+    Точный перебор для n ≤ 8, иначе — DP Held-Karp для пути.
+    """
     n = len(movable)
     if n == 0:
         return True, 0, []
@@ -346,7 +351,7 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
         fillers_used=len(with_fillers) - len(base_order),  # только новые
         strong_conflicts=strong_cnt,
         weak_conflicts=weak_cnt,
-        meta={"status": "ideal", **feas},
+        meta={"status": "ideal"},
     )
 
 
@@ -358,7 +363,7 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
 async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
     rng = random.Random(seed)
     existing = sum(1 for b in blocks if b.type == "filler")
-    max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing)
+    max_weak_allowed = max(0, MAX_FILLERS_TOTAL - existing)  # только новые
     log.info("🧮 Стохастика (seed=%s) | уже есть тянучек=%d, можно добавить=%d", seed, existing, max_weak_allowed)
 
     base = [_copy_block(b) for b in blocks]
@@ -372,6 +377,7 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
     elif len(perf_idx) >= 2:
         for i in perf_idx[:2]:
             base[i].fixed = True
+
     movable = [b for b in base if b.type == "performance" and not b.fixed]
     if not movable:
         log.warning("⚠️ Все блоки фиксированы (seed=%s)", seed)
@@ -399,6 +405,7 @@ async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrange
 
     if not best:
         log.error("❌ Не найдено допустимых перестановок (seed=%s)", seed)
+    #    Возвращаем исходное без краша — как и было
         return Arrangement(seed=seed, blocks=blocks, fillers_used=existing)
 
     with_fillers = _insert_fillers(best, max_weak_allowed, seed)
@@ -429,44 +436,47 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
     ideal = await theoretical_check(blocks)
     if ideal.meta.get("status") == "infeasible":
         return [ideal]
+    log.info("🌟 Отправляю идеальный вариант пользователю, затем ищу альтернативы...")
 
-    # Берём минимально нужное число тянучек N из мета-данных идеала
-    min_needed = ideal.meta.get("min_weak_needed", 0)
-    log.info("🌟 Теоретически требуется %d тянучек — генерируем 5 вариантов с ровно N и 5 по старой схеме", min_needed)
+    # Получим N — минимально необходимое число тянучек — из того же расчёта, не меняя логику теоретической проверки
+    feas = theoretical_feasibility_exact(blocks, MAX_FILLERS_TOTAL)
+    min_needed = int(feas["min_weak_needed"])
 
     arrangements: List[Arrangement] = [ideal]
     seen = {arrangement_hash(ideal.blocks)}
 
     # ----------------------------------------------------------
-    # 2) Пакет №1: 5 вариантов с РОВНО N тянучками
+    # 2) 5 вариантов с РОВНО N тянучками
     # ----------------------------------------------------------
-    seeds_fixed = [random.randint(1000, 99999) for _ in range(n_variants)]
-    for s in seeds_fixed:
+    log.info("🎯 Генерация 5 вариантов с ровно %d тянучками", min_needed)
+    tries = 0
+    while len(arrangements) < 1 + n_variants and tries < MAX_TRIES:
+        s = random.randint(1000, 99999)
         arr = await stochastic_branch_and_bound(blocks, s)
         if arr.fillers_used == min_needed:
             h = arrangement_hash(arr.blocks)
             if h not in seen:
                 arrangements.append(arr)
                 seen.add(h)
+        tries += 1
         await asyncio.sleep(0)
         gc.collect()
-        if len(arrangements) >= 1 + n_variants:  # идеал + 5 фиксированных
-            break
 
     # ----------------------------------------------------------
-    # 3) Пакет №2: ещё 5 вариантов в стандартном режиме
+    # 3) Ещё 5 вариантов в стандартном режиме
     # ----------------------------------------------------------
-    seeds_extra = [random.randint(1000, 99999) for _ in range(n_variants)]
-    for s in seeds_extra:
+    log.info("🎲 Генерация дополнительных 5 вариантов в стандартном режиме")
+    tries2 = 0
+    while len(arrangements) < 1 + 2 * n_variants and tries2 < MAX_TRIES:
+        s = random.randint(1000, 99999)
         arr = await stochastic_branch_and_bound(blocks, s)
         h = arrangement_hash(arr.blocks)
         if h not in seen:
             arrangements.append(arr)
             seen.add(h)
+        tries2 += 1
         await asyncio.sleep(0)
         gc.collect()
-        if len(arrangements) >= 1 + 2 * n_variants:
-            break
 
     log.info("✅ Сгенерировано вариантов (включая идеальный): %d", len(arrangements))
     return arrangements
