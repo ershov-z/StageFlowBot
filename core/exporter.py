@@ -7,6 +7,8 @@ from typing import Dict, List, Optional
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from docx import Document
+from docx.document import Document as DocumentType
+from docx.table import Table
 
 from core.types import Arrangement
 
@@ -132,6 +134,42 @@ def _populate_table(table, blocks, mapping: Dict[str, Optional[int]]) -> None:
         kv_value = getattr(block, "kv_raw", "") or ("кв" if getattr(block, "kv", False) else "")
         _set_cell_text(row, mapping, "kv", kv_value)
 
+
+def _score_mapping(mapping: Dict[str, Optional[int]]) -> tuple[int, int]:
+    """Оценка соответствия таблицы ожидаемой структуре."""
+    required = ("actors", "pp", "kv")
+    required_hit = sum(1 for key in required if mapping.get(key) is not None)
+    total_hit = sum(1 for value in mapping.values() if value is not None)
+    return required_hit, total_hit
+
+
+def _find_target_table(doc: DocumentType) -> Optional[tuple[Table, Dict[str, Optional[int]]]]:
+    """Находит таблицу с наилучшим соответствием ожидаемым колонкам."""
+    best: Optional[tuple[Table, Dict[str, Optional[int]], tuple[int, int]]] = None
+
+    for table in doc.tables:
+        if not table.rows:
+            continue
+
+        header_cells = [cell.text for cell in table.rows[0].cells]
+        if not header_cells:
+            continue
+
+        mapping = _guess_mapping_by_header(header_cells)
+        if mapping is None:
+            mapping = _fallback_mapping_by_count(len(header_cells))
+
+        score = _score_mapping(mapping)
+        if best is None or score > best[2]:
+            best = (table, mapping, score)
+            if score[0] == 3:  # нашли таблицу с ключевыми колонками
+                break
+
+    if best is None:
+        return None
+
+    return best[0], best[1]
+
 # ============================================================
 # DOCX и JSON экспорт
 # ============================================================
@@ -145,14 +183,16 @@ def create_docx(
     """Генерация DOCX-файла программы с сохранением структуры исходного шаблона."""
 
     template = Path(template_path) if template_path else None
-    doc = None
+    doc: DocumentType | None = None
 
     if template and template.exists():
         try:
             doc = Document(template)
             log.debug(f"[EXPORT] Используется шаблон DOCX: {template}")
         except Exception as exc:  # pragma: no cover - защитное логирование
-            log.warning(f"[EXPORT] Не удалось открыть шаблон {template}: {exc}. Используем пустой документ.")
+            log.warning(
+                f"[EXPORT] Не удалось открыть шаблон {template}: {exc}. Используем пустой документ."
+            )
             doc = None
 
     if doc is None:
@@ -171,16 +211,13 @@ def create_docx(
         log.info(f"[EXPORT] DOCX сохранён (без шаблона): {path.name}")
         return
 
-    if not doc.tables or not doc.tables[0].rows:
-        log.warning("[EXPORT] Шаблон не содержит таблиц. Переходим к простому экспорту.")
+    table_and_mapping = _find_target_table(doc)
+    if table_and_mapping is None:
+        log.warning("[EXPORT] Шаблон не содержит подходящих таблиц. Переходим к простому экспорту.")
         create_docx(blocks, path, title=title, template_path=None)
         return
 
-    table = doc.tables[0]
-    header_cells = [cell.text for cell in table.rows[0].cells]
-    mapping = _guess_mapping_by_header(header_cells)
-    if mapping is None:
-        mapping = _fallback_mapping_by_count(len(table.rows[0].cells))
+    table, mapping = table_and_mapping
 
     _clear_table_data(table)
     _populate_table(table, blocks, mapping)
