@@ -91,18 +91,13 @@ def _segment_cost_with_bounds(order: List[Block], L: Block, R: Block) -> int:
 # ============================================================
 
 def _segment_optimal_orders(movable: List[Block], L: Block, R: Block, seed: int) -> Tuple[bool, int, List[List[Block]]]:
-    """
-    Возвращает (feasible, min_cost, список оптимальных перестановок)
-    с адаптивным порогом глубины. Работает всегда одним методом.
-    """
     n = len(movable)
     if n == 0:
         return True, 0, [[]]
 
     rng = random.Random(seed)
-    # определяем глубину в зависимости от размера сегмента
     if n <= 7:
-        sample_limit = None  # полный перебор
+        sample_limit = None
     elif n <= 10:
         sample_limit = 512
     else:
@@ -144,7 +139,6 @@ def _build_ideal_order(blocks: List[Block], seed: int) -> Tuple[bool, int, List[
     rng = random.Random(seed)
     base = [_copy_block(b) for b in blocks]
 
-    # фиксируем неподвижные блоки
     for b in base:
         if b.type in {"prelude", "sponsor"} or b.type == "filler":
             b.fixed = True
@@ -184,7 +178,7 @@ def _build_ideal_order(blocks: List[Block], seed: int) -> Tuple[bool, int, List[
 
 
 # ============================================================
-# Проверка и вставка тянучек
+# Вставка тянучек
 # ============================================================
 
 def _insert_fillers(blocks: List[Block], max_fillers: int, seed: int) -> List[Block]:
@@ -260,67 +254,18 @@ async def theoretical_check(blocks: List[Block]) -> Arrangement:
 # Стохастика и генерация всех вариантов
 # ============================================================
 
-@measure_time("optimizer.stochastic_branch_and_bound")
-async def stochastic_branch_and_bound(blocks: List[Block], seed: int) -> Arrangement:
-    rng = random.Random(seed)
-    base = [_copy_block(b) for b in blocks]
-    for b in base:
-        if b.type in {"prelude", "sponsor"} or b.type == "filler":
-            b.fixed = True
-    perf_idx = [i for i, b in enumerate(base) if b.type == "performance"]
-    if len(perf_idx) >= 6:
-        for i in perf_idx[:2] + perf_idx[-4:]:
-            base[i].fixed = True
-    elif len(perf_idx) >= 2:
-        for i in perf_idx[:2]:
-            base[i].fixed = True
-
-    movable = [b for b in base if b.type == "performance" and not b.fixed]
-    if not movable:
-        return Arrangement(seed=seed, blocks=blocks, fillers_used=0)
-
-    best, best_weak = None, 999
-    for _ in range(MAX_TRIES):
-        shuf = movable[:]
-        rng.shuffle(shuf)
-        new_order = []
-        m_idx = 0
-        for b in base:
-            if b.fixed:
-                new_order.append(b)
-            else:
-                new_order.append(shuf[m_idx])
-                m_idx += 1
-        if _has_strong_conflicts(new_order):
-            continue
-        w = sum(
-            weak_conflict(new_order[i], new_order[i + 1])
-            for i in range(len(new_order) - 1)
-            if new_order[i].type == new_order[i + 1].type == "performance"
-        )
-        if w <= MAX_FILLERS_TOTAL:
-            best, best_weak = new_order, w
-            if w == 0:
-                break
-
-    if not best:
-        return Arrangement(seed=seed, blocks=blocks, fillers_used=0)
-
-    with_fillers = _insert_fillers(best, MAX_FILLERS_TOTAL, seed)
-    return Arrangement(seed=seed, blocks=with_fillers, fillers_used=len(with_fillers) - len(best))
-
-
 @measure_time("optimizer.generate_arrangements")
 async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIANTS) -> List[Arrangement]:
     ideal0 = await theoretical_check(blocks)
-    if ideal0.meta.get("status") == "infeasible":
+    if str(ideal0.meta.get("status", "")).lower() == "infeasible":
         return [ideal0]
 
     results = [ideal0]
     seen = {arrangement_hash(ideal0.blocks)}
 
     # 🟢 Генерируем дополнительные идеальные варианты
-    for _ in range(4):
+    ideal_count = 0
+    for _ in range(6):
         s = random.randint(1000, 99999)
         feasible, minw, order = _build_ideal_order(blocks, s)
         if feasible:
@@ -337,6 +282,10 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
             if h not in seen:
                 results.append(arr)
                 seen.add(h)
+                ideal_count += 1
+
+    if ideal_count == 0:
+        log.warning("⚠️ Обнаружен только один уникальный идеальный порядок — все перестановки идентичны.")
 
     # 🎲 Стохастические варианты
     for _ in range(n_variants):
@@ -349,5 +298,5 @@ async def generate_arrangements(blocks: List[Block], n_variants: int = MAX_VARIA
         await asyncio.sleep(0)
         gc.collect()
 
-    log.info(f"✅ Сгенерировано вариантов: идеальных={len([r for r in results if r.meta.get('status')=='ideal'])}, стохастических={len(results)-1}")
+    log.info(f"✅ Сгенерировано вариантов: идеальных={len([r for r in results if str(r.meta.get('status', '')).lower() == 'ideal'])}, стохастических={len(results)-1}")
     return results
