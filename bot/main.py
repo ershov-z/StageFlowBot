@@ -17,7 +17,7 @@ import aiohttp
 from core.parser import parse_docx
 from core.optimizer import generate_arrangements
 from core.validator import validate_arrangement
-from core.exporter import export_all
+from core.exporter import export_all_variants as export_all
 
 # --- bot utils ---
 from bot import responses
