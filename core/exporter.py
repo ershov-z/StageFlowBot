@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
+
 from docx import Document
 
 from core.types import Arrangement

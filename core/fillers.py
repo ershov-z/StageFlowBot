@@ -1,7 +1,9 @@
 # core/fillers.py
 from __future__ import annotations
+
 import logging
 from typing import Optional
+
 from core.types import Block, Actor
 
 log = logging.getLogger("stageflow.fillers")
